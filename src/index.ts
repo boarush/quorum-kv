@@ -1,4 +1,5 @@
 import type { Env } from "./config";
+import { config } from "./config";
 import { QuorumKV, QuorumUnavailable } from "./coordinator";
 export { Replica } from "./replica";
 
@@ -31,6 +32,7 @@ export default {
         }
         case "PUT": {
           // Bound buffered values before sending three copies across regions.
+          const maxValueBytes = config(env).maxValueBytes;
           const reader = request.body?.getReader();
           const chunks: Uint8Array[] = [];
           let length = 0;
@@ -39,9 +41,9 @@ export default {
               const { done, value } = await reader.read();
               if (done) break;
               length += value.byteLength;
-              if (length > 1024 * 1024) {
+              if (length > maxValueBytes) {
                 await reader.cancel();
-                return new Response("Value exceeds 1 MiB", { status: 413 });
+                return new Response(`Value exceeds ${maxValueBytes} bytes`, { status: 413 });
               }
               chunks.push(value);
             }

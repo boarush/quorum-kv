@@ -422,3 +422,41 @@ it("syncs retained expired versions even when their deadline predates grace", as
   expect(synced.version.counter).toBe(8);
   expect(synced.value).toBeNull();
 });
+
+it("enforces the configurable byte limit for HTTP and the programmatic API before RPCs", async () => {
+  const h = await setup({ MAX_VALUE_BYTES: "4" });
+  expect((await h.request("PUT", new Uint8Array(4))).status).toBe(204);
+  expect((await h.request("PUT", new Uint8Array(5))).status).toBe(413);
+  expect((await h.request("PUT", "ééé")).status).toBe(413);
+  const phases = h.kv.phases.length;
+  await expect(h.kv.put(h.key, new ArrayBuffer(5))).rejects.toBeInstanceOf(RangeError);
+  expect(h.kv.phases).toHaveLength(phases);
+  await h.kv.put(h.key, new ArrayBuffer(4));
+  expect((await h.kv.get(h.key))!.byteLength).toBe(4);
+  expect(config(h.bindings).maxValueBytes).toBe(4);
+  expect(() => config({ ...h.bindings, MAX_VALUE_BYTES: "0" })).toThrow();
+});
+
+it("accepts the default 1 MiB boundary and rejects a larger programmatic value", async () => {
+  const h = await setup();
+  const size = config(h.bindings).maxValueBytes;
+  expect(size).toBe(1024 * 1024);
+  await h.kv.put(h.key, new ArrayBuffer(size));
+  expect((await h.kv.get(h.key))!.byteLength).toBe(size);
+  await expect(h.kv.put(h.key, new ArrayBuffer(size + 1))).rejects.toBeInstanceOf(RangeError);
+});
+
+it("bounds streamed bodies by actual bytes instead of trusting Content-Length", async () => {
+  const h = await setup({ MAX_VALUE_BYTES: "4" });
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(new Uint8Array(3));
+      controller.enqueue(new Uint8Array(2));
+      controller.close();
+    },
+  });
+  const response = await worker.fetch(new Request(`https://test/kv/${h.key}`, {
+    method: "PUT", body, headers: { "Content-Length": "1" },
+  }), h.bindings, h.ctx);
+  expect(response.status).toBe(413);
+});

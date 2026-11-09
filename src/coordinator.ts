@@ -97,6 +97,9 @@ export class QuorumKV {
   }
 
   async put(key: string, value: ArrayBuffer, options: { ttlSeconds?: number } = {}): Promise<void> {
+    if (value.byteLength > this.options.maxValueBytes) {
+      throw new RangeError(`Value exceeds ${this.options.maxValueBytes} bytes`);
+    }
     const ttl = options.ttlSeconds;
     if (ttl !== undefined && (!Number.isFinite(ttl) || ttl <= 0 ||
       !Number.isSafeInteger(Math.ceil(Date.now() + ttl * 1000 + this.options.gcGraceMs)))) {
