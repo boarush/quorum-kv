@@ -1,29 +1,56 @@
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "./config";
-import { DEFAULTS, positiveInteger } from "./config";
+import { config } from "./config";
 import { compare, EMPTY, type RecordValue, type Version } from "./model";
 
 type Row = {
+  key: string;
   value: ArrayBuffer | null;
   counter: number;
   writer: string;
   expires_at: number | null;
   gc_at: number | null;
-}
+  seq: number;
+};
+
+const recordValue = (row: Row): RecordValue => ({
+  value: row.value, version: { counter: row.counter, writer: row.writer }, expiresAt: row.expires_at,
+});
 
 export class Replica extends DurableObject<Env> {
   private fault = { delayMs: 0, fail: false };
-  private readonly grace: number;
+  private readonly options;
+  private readonly name: string;
+  private readonly peers: { name: string; stub: DurableObjectStub<Replica> }[];
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
-    this.grace = positiveInteger(env.GC_GRACE_MS, DEFAULTS.gcGraceMs);
-    ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS records (
+    this.options = config(env);
+    // Named RPCs and their alarms preserve ctx.id.name in the current runtime.
+    const name = ctx.id.name;
+    if (!name || !/^shard-\d+-r[012]$/.test(name)) throw new Error("Replica must be accessed by shard name");
+    this.name = name;
+    this.peers = this.options.hints.flatMap((locationHint, i) => {
+      const peer = name.replace(/r[012]$/, `r${i}`);
+      return peer === name ? [] : [{
+        name: peer, stub: env.REPLICAS.get(env.REPLICAS.idFromName(peer), { locationHint }),
+      }];
+    });
+    const sql = ctx.storage.sql;
+    sql.exec(`CREATE TABLE IF NOT EXISTS records (
       key TEXT PRIMARY KEY, value BLOB, counter INTEGER NOT NULL,
-      writer TEXT NOT NULL, expires_at REAL, gc_at REAL
+      writer TEXT NOT NULL, expires_at REAL, gc_at REAL, seq INTEGER NOT NULL
     )`);
-    ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS expiry ON records(expires_at)");
-    ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS gc ON records(gc_at)");
+    if (!sql.exec<{ name: string }>("PRAGMA table_info(records)").toArray().some(column => column.name === "seq")) {
+      sql.exec("ALTER TABLE records ADD COLUMN seq INTEGER NOT NULL DEFAULT 0");
+      sql.exec("UPDATE records SET seq = rowid");
+    }
+    sql.exec("CREATE INDEX IF NOT EXISTS changes ON records(seq)");
+    sql.exec("CREATE TABLE IF NOT EXISTS sequence (id INTEGER PRIMARY KEY CHECK(id = 1), seq INTEGER NOT NULL)");
+    sql.exec("INSERT OR IGNORE INTO sequence SELECT 1, COALESCE(MAX(seq), 0) FROM records");
+    sql.exec("CREATE TABLE IF NOT EXISTS peers (name TEXT PRIMARY KEY, cursor INTEGER NOT NULL DEFAULT 0, ack INTEGER NOT NULL DEFAULT 0)");
+    for (const peer of this.peers) sql.exec("INSERT OR IGNORE INTO peers(name) VALUES (?)", peer.name);
+    ctx.blockConcurrencyWhile(() => this.schedule());
   }
 
   private async before() {
@@ -33,12 +60,8 @@ export class Replica extends DurableObject<Env> {
   }
 
   private stored(key: string): RecordValue {
-    const row = this.ctx.storage.sql.exec<Row>(
-      "SELECT value, counter, writer, expires_at, gc_at FROM records WHERE key = ?", key,
-    ).toArray()[0];
-    return row
-      ? { value: row.value, version: { counter: row.counter, writer: row.writer }, expiresAt: row.expires_at }
-      : EMPTY;
+    const row = this.ctx.storage.sql.exec<Row>("SELECT * FROM records WHERE key = ?", key).toArray()[0];
+    return row ? recordValue(row) : EMPTY;
   }
 
   async readVersion(key: string): Promise<Version> {
@@ -51,41 +74,82 @@ export class Replica extends DurableObject<Env> {
     return this.stored(key);
   }
 
-  async write(key: string, record: RecordValue): Promise<void> {
-    await this.before();
-    // No await between compare and upsert: concurrent RPCs cannot regress a version.
+  private apply(key: string, record: RecordValue): void {
     if (compare(record.version, this.stored(key).version) <= 0) return;
     const gcAt = record.expiresAt !== null
-      ? record.expiresAt + this.grace
-      : record.value === null ? Date.now() + this.grace : null;
+      ? record.expiresAt + this.options.gcGraceMs
+      : record.value === null ? Date.now() + this.options.gcGraceMs : null;
+    const seq = this.ctx.storage.sql.exec<{ seq: number }>("UPDATE sequence SET seq = seq + 1 WHERE id = 1 RETURNING seq").one().seq;
     this.ctx.storage.sql.exec(
-      `INSERT INTO records VALUES (?, ?, ?, ?, ?, ?)
+      `INSERT INTO records (key, value, counter, writer, expires_at, gc_at, seq) VALUES (?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(key) DO UPDATE SET value=excluded.value, counter=excluded.counter,
-       writer=excluded.writer, expires_at=excluded.expires_at, gc_at=excluded.gc_at`,
-      key, record.value, record.version.counter, record.version.writer, record.expiresAt, gcAt,
+       writer=excluded.writer, expires_at=excluded.expires_at, gc_at=excluded.gc_at, seq=excluded.seq`,
+      key, record.value, record.version.counter, record.version.writer, record.expiresAt, gcAt, seq,
     );
+  }
+
+  async write(key: string, record: RecordValue & { writtenAt: number }): Promise<void> {
+    await this.before();
+    if (!Number.isFinite(record.writtenAt) || record.writtenAt < Date.now() - this.options.gcGraceMs) {
+      throw new RangeError("Write exceeds GC grace");
+    }
+    // Sequence allocation and visibility are atomic; sync uses the same version guard.
+    this.ctx.storage.transactionSync(() => this.apply(key, record));
     await this.schedule();
+  }
+
+  async pull(fromPeer: string, cursor: number): Promise<{ rows: { key: string; record: RecordValue }[]; cursor: number }> {
+    await this.before();
+    if (!this.peers.some(peer => peer.name === fromPeer) || !Number.isSafeInteger(cursor) || cursor < 0) {
+      throw new Error("Invalid peer cursor");
+    }
+    this.ctx.storage.sql.exec("UPDATE peers SET ack = MAX(ack, ?) WHERE name = ?", cursor, fromPeer);
+    const rows = this.ctx.storage.sql.exec<Row>("SELECT * FROM records WHERE seq > ? ORDER BY seq LIMIT 4", cursor).toArray();
+    return { rows: rows.map(row => ({ key: row.key, record: recordValue(row) })), cursor: rows.at(-1)?.seq ?? cursor };
+  }
+
+  private async sync(peer: { name: string; stub: DurableObjectStub<Replica> }) {
+    const cursor = this.ctx.storage.sql.exec<{ cursor: number }>("SELECT cursor FROM peers WHERE name = ?", peer.name).one().cursor;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const batch = await Promise.race([
+        peer.stub.pull(this.name, cursor),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error("Sync timeout")), this.options.timeoutMs);
+        }),
+      ]);
+      this.ctx.storage.transactionSync(() => {
+        // Held versions can be arbitrarily old. Only direct coordinator writes expire.
+        for (const { key, record } of batch.rows) this.apply(key, record);
+        this.ctx.storage.sql.exec("UPDATE peers SET cursor = ? WHERE name = ?", batch.cursor, peer.name);
+      });
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   private async schedule() {
+    const now = Date.now();
     const row = this.ctx.storage.sql.exec<{ next: number | null }>(
-      `SELECT MIN(deadline) AS next FROM (
-         SELECT expires_at AS deadline FROM records WHERE value IS NOT NULL AND expires_at IS NOT NULL
-         UNION ALL SELECT gc_at AS deadline FROM records WHERE gc_at IS NOT NULL
-       )`,
+      "SELECT MIN(expires_at) AS next FROM records WHERE value IS NOT NULL AND expires_at > ?", now,
     ).one();
-    if (row.next === null) await this.ctx.storage.deleteAlarm();
-    else await this.ctx.storage.setAlarm(Math.max(Date.now() + 1, row.next));
+    const next = Math.min(now + this.options.syncMs, row.next ?? Infinity);
+    const alarm = await this.ctx.storage.getAlarm();
+    if (alarm === null || alarm > next) await this.ctx.storage.setAlarm(next);
   }
 
   async alarm(): Promise<void> {
-    const now = Date.now();
-    // Drop expired payloads, but keep their versions until grace elapses.
-    this.ctx.storage.sql.exec(
-      "UPDATE records SET value = NULL WHERE expires_at <= ? AND value IS NOT NULL", now,
-    );
-    this.ctx.storage.sql.exec("DELETE FROM records WHERE gc_at <= ?", now);
-    await this.schedule();
+    try {
+      await this.before();
+      await Promise.allSettled(this.peers.map(peer => this.sync(peer)));
+      const now = Date.now();
+      this.ctx.storage.sql.exec("UPDATE records SET value = NULL WHERE expires_at <= ? AND value IS NOT NULL", now);
+      this.ctx.storage.sql.exec(
+        "DELETE FROM records WHERE gc_at <= ? AND seq <= (SELECT MIN(ack) FROM peers)", now,
+      );
+    } finally {
+      await this.schedule();
+    }
   }
 
   async setFault(fault: { delayMs?: number; fail?: boolean }): Promise<void> {

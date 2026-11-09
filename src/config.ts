@@ -6,6 +6,7 @@ export interface Env {
   LOCATION_HINTS?: string;
   REPLICA_TIMEOUT_MS?: string;
   GC_GRACE_MS?: string;
+  SYNC_MS?: string;
   TESTING?: string;
 }
 
@@ -14,6 +15,7 @@ export const DEFAULTS = {
   hints: ["apac", "me", "weur"] as DurableObjectLocationHint[],
   timeoutMs: 1500,
   gcGraceMs: 86_400_000,
+  syncMs: 30_000,
 };
 
 export function positiveInteger(value: string | undefined, fallback: number): number {
@@ -33,5 +35,6 @@ export function config(env: Env) {
     hints: hints as DurableObjectLocationHint[],
     timeoutMs: positiveInteger(env.REPLICA_TIMEOUT_MS, DEFAULTS.timeoutMs),
     gcGraceMs: positiveInteger(env.GC_GRACE_MS, DEFAULTS.gcGraceMs),
+    syncMs: positiveInteger(env.SYNC_MS, DEFAULTS.syncMs),
   };
 }

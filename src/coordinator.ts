@@ -91,7 +91,7 @@ export class QuorumKV {
     const order = compare(first.version, second.version);
     const newest = order >= 0 ? first : second;
     if (order !== 0) {
-      await this.quorum(key, "repair", stub => stub.write(key, newest));
+      await this.quorum(key, "repair", stub => stub.write(key, { ...newest, writtenAt: Date.now() }));
     }
     return newest.expiresAt !== null && newest.expiresAt <= Date.now() ? null : newest.value;
   }
@@ -114,6 +114,6 @@ export class QuorumKV {
     const counter = Math.max(...versions.map(version => version.counter)) + 1;
     if (!Number.isSafeInteger(counter)) throw new QuorumUnavailable();
     const record: RecordValue = { value, version: { counter, writer: crypto.randomUUID() }, expiresAt };
-    await this.quorum(key, "write", stub => stub.write(key, record));
+    await this.quorum(key, "write", stub => stub.write(key, { ...record, writtenAt: Date.now() }));
   }
 }
