@@ -1,0 +1,6 @@
+node_modules/
+.alchemy/
+.wrangler/
+coverage/
+.env
+.dev.vars

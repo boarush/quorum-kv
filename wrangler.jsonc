@@ -1,0 +1,24 @@
+{
+  "name": "quorum-kv",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-11-09",
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "REPLICAS",
+        "class_name": "Replica"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": [
+        "Replica"
+      ]
+    }
+  ]
+}
