@@ -104,7 +104,7 @@ export class Replica extends DurableObject<Env> {
       throw new Error("Invalid peer cursor");
     }
     this.ctx.storage.sql.exec("UPDATE peers SET ack = MAX(ack, ?) WHERE name = ?", cursor, fromPeer);
-    const rows = this.ctx.storage.sql.exec<Row>("SELECT * FROM records WHERE seq > ? ORDER BY seq LIMIT 4", cursor).toArray();
+    const rows = this.ctx.storage.sql.exec<Row>("SELECT * FROM records WHERE seq > ? ORDER BY seq LIMIT ?", cursor, this.options.syncBatch).toArray();
     return { rows: rows.map(row => ({ key: row.key, record: recordValue(row) })), cursor: rows.at(-1)?.seq ?? cursor };
   }
 

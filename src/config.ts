@@ -7,6 +7,7 @@ export interface Env {
   REPLICA_TIMEOUT_MS?: string;
   GC_GRACE_MS?: string;
   SYNC_MS?: string;
+  SYNC_BATCH?: string;
   MAX_VALUE_BYTES?: string;
   TESTING?: string;
 }
@@ -17,6 +18,7 @@ export const DEFAULTS = {
   timeoutMs: 1500,
   gcGraceMs: 86_400_000,
   syncMs: 30_000,
+  syncBatch: 256,
   maxValueBytes: 1024 * 1024,
 };
 
@@ -38,6 +40,7 @@ export function config(env: Env) {
     timeoutMs: positiveInteger(env.REPLICA_TIMEOUT_MS, DEFAULTS.timeoutMs),
     gcGraceMs: positiveInteger(env.GC_GRACE_MS, DEFAULTS.gcGraceMs),
     syncMs: positiveInteger(env.SYNC_MS, DEFAULTS.syncMs),
+    syncBatch: positiveInteger(env.SYNC_BATCH, DEFAULTS.syncBatch),
     maxValueBytes: positiveInteger(env.MAX_VALUE_BYTES, DEFAULTS.maxValueBytes),
   };
 }

@@ -85,13 +85,15 @@ export class QuorumKV {
   }
 
   async get(key: string): Promise<ArrayBuffer | null> {
+    // Stamp repairs with when the read began, so a stalled read can't pass off old data as fresh.
+    const started = Date.now();
     const records = await this.quorum(key, "read", stub => stub.read(key));
     const first = records[0]!;
     const second = records[1]!;
     const order = compare(first.version, second.version);
     const newest = order >= 0 ? first : second;
     if (order !== 0) {
-      await this.quorum(key, "repair", stub => stub.write(key, { ...newest, writtenAt: Date.now() }));
+      await this.quorum(key, "repair", stub => stub.write(key, { ...newest, writtenAt: started }));
     }
     return newest.expiresAt !== null && newest.expiresAt <= Date.now() ? null : newest.value;
   }
@@ -113,10 +115,11 @@ export class QuorumKV {
   }
 
   private async store(key: string, value: ArrayBuffer | null, expiresAt: number | null) {
+    const started = Date.now();
     const versions = await this.quorum(key, "version", stub => stub.readVersion(key));
     const counter = Math.max(...versions.map(version => version.counter)) + 1;
     if (!Number.isSafeInteger(counter)) throw new QuorumUnavailable();
     const record: RecordValue = { value, version: { counter, writer: crypto.randomUUID() }, expiresAt };
-    await this.quorum(key, "write", stub => stub.write(key, { ...record, writtenAt: Date.now() }));
+    await this.quorum(key, "write", stub => stub.write(key, { ...record, writtenAt: started }));
   }
 }
