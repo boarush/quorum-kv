@@ -120,6 +120,7 @@ it("serves reads, writes, and deletes when any one replica is down", async () =>
     expect(text(await (await h.request()).arrayBuffer())).toBe("available");
     expect((await h.request("DELETE")).status).toBe(204);
     expect((await h.request()).status).toBe(404);
+    await h.replicas[down]!.stub.setFault({});
   }
 });
 
@@ -131,6 +132,16 @@ it("takes the fastest two replicas without waiting for a slow replica or its tim
   expect(text(await (await h.request()).arrayBuffer())).toBe("fast");
   expect(Date.now() - start).toBeLessThan(250);
   await pause(650); // Drain late RPCs before resetting their storage.
+});
+
+it("takes the fastest two replicas without waiting for a slow replica within its timeout", async () => {
+  const h = await setup({ REPLICA_TIMEOUT_MS: "1000" });
+  await h.replicas[2]!.stub.setFault({ delayMs: 500 });
+  const start = Date.now();
+  expect((await h.request("PUT", "fast")).status).toBe(204);
+  expect(text(await (await h.request()).arrayBuffer())).toBe("fast");
+  expect(Date.now() - start).toBeLessThan(250);
+  await pause(550); // Drain late RPCs before resetting their storage.
 });
 
 it("returns 503 without quorum instead of serving a lone replica", async () => {
