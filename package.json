@@ -22,8 +22,7 @@
     "jiti": "latest",
     "typescript": "latest",
     "typescript-eslint": "latest",
-    "vitest": "^4.1.0",
-    "wrangler": "latest"
+    "vitest": "^4.1.0"
   },
   "engines": {
     "node": ">=24.11.1"

@@ -10,7 +10,7 @@ A normal read costs three DO RPCs and about one RTT to the second-fastest replic
 
 Run `npm ci`, then `npm run check` for TypeScript, ESLint, and the Vitest integration suite. Tests use actual local workerd SQLite Durable Objects through `@cloudflare/vitest-plugin`, the current successor to `@cloudflare/vitest-pool-workers`. Test-only RPC fault injection is enabled only by the Vitest binding, never by the HTTP API.
 
-Run `npm run dev` for Alchemy local development at http://localhost:31463. Override the local port with `PORT`. Alchemy uses local stack state and needs no Cloudflare credentials for local execution. `npm run deploy` requires a configured Alchemy Cloudflare profile; deployment is not part of the local test suite. Keep the local `.alchemy` state for subsequent deploys. `npx wrangler dev --port 31463` is an alternative local runner using the included equivalent Wrangler binding and SQLite migration.
+Run `npm run dev` for Alchemy local development at http://localhost:31463. Override the local port with `PORT`. Alchemy uses local stack state and needs no Cloudflare credentials for local execution. `npm run deploy` requires a configured Alchemy Cloudflare profile; deployment is not part of the local test suite. Keep the local `.alchemy` state for subsequent deploys.
 
 Runtime bindings `SHARDS`, `LOCATION_HINTS` (three comma-separated hints), `REPLICA_TIMEOUT_MS`, `GC_GRACE_MS`, `SYNC_MS`, and `MAX_VALUE_BYTES` override defaults. Set them consistently in the Alchemy Worker environment, or in Wrangler vars when using Wrangler. Defaults live in `src/config.ts`. Do not change the shard count, hash, replica names, or hint ordering for an existing deployment without a migration.
 
