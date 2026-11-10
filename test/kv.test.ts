@@ -7,7 +7,7 @@ import { afterEach, expect, it } from "vitest";
 import worker from "../src/index";
 import type { Env } from "../src/config";
 import { config } from "../src/config";
-import { QuorumKV } from "../src/coordinator";
+import { QuorumKV, QuorumUnavailable } from "../src/coordinator";
 import { compare, type RecordValue } from "../src/model";
 
 const contexts: ExecutionContext[] = [];
@@ -30,6 +30,26 @@ async function setup(overrides: Partial<Env> = {}) {
         method, body, headers: debug ? { "X-KV-Debug": "1" } : {},
       }), bindings, ctx),
   };
+}
+
+function repairFailingEnv(bindings: Env, failing: Set<string>): Env {
+  const namespace = bindings.REPLICAS;
+  return {
+    ...bindings,
+    REPLICAS: {
+      idFromName: (name: string) => namespace.idFromName(name),
+      get: (...args: Parameters<Env["REPLICAS"]["get"]>) => {
+        const [id, options] = args;
+        const stub = namespace.get(id, options);
+        if (!id.name || !failing.has(id.name)) return stub;
+        return {
+          read: (key: string) => stub.read(key),
+          readVersion: (key: string) => stub.readVersion(key),
+          write: async () => { throw new Error("Injected repair failure"); },
+        } as unknown as ReturnType<Env["REPLICAS"]["get"]>;
+      },
+    } as unknown as Env["REPLICAS"],
+  } as Env;
 }
 
 afterEach(async () => {
@@ -150,6 +170,23 @@ it("returns 503 without quorum instead of serving a lone replica", async () => {
   for (const method of ["GET", "PUT", "DELETE"]) {
     expect((await h.request(method, method === "PUT" ? "no-quorum" : undefined)).status).toBe(503);
   }
+});
+
+it("rejects a read when the repair quorum is unavailable", async () => {
+  const h = await setup();
+  const stale: RecordValue = { value: bytes("stale"), version: { counter: 1, writer: "a" }, expiresAt: null };
+  const fresh: RecordValue = { value: bytes("fresh"), version: { counter: 2, writer: "b" }, expiresAt: null };
+  await h.replicas[0]!.stub.write(h.key, stamped(stale));
+  await Promise.all(h.replicas.slice(1).map(({ stub }) => stub.write(h.key, stamped(fresh))));
+  await h.replicas[2]!.stub.setFault({ delayMs: 100 });
+  const kv = new QuorumKV(
+    repairFailingEnv(h.bindings, new Set([h.replicas[0]!.name, h.replicas[1]!.name])),
+    h.ctx,
+  );
+  await expect(kv.get(h.key)).rejects.toBeInstanceOf(QuorumUnavailable);
+  expect(kv.phases.map(phase => phase.name)).toEqual(["read", "repair"]);
+  await waitOnExecutionContext(h.ctx);
+  await h.replicas[2]!.stub.setFault({});
 });
 
 it("bounds unresponsive quorum attempts with per-replica timeouts", async () => {
