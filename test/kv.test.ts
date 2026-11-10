@@ -355,6 +355,17 @@ it("uses stable fixed shards, distinct hints, and validates topology configurati
   expect(() => config({ ...h.bindings, REPLICA_TIMEOUT_MS: "-1" })).toThrow();
 });
 
+it("bounds timer configuration and isolates the default hints", async () => {
+  const h = await setup();
+  expect(config({ ...h.bindings, LOCATION_HINTS: " apac , me , weur " }).hints)
+    .toEqual(["apac", "me", "weur"]);
+  expect(config({ ...h.bindings, REPLICA_TIMEOUT_MS: "2147483647" }).timeoutMs).toBe(2 ** 31 - 1);
+  expect(() => config({ ...h.bindings, REPLICA_TIMEOUT_MS: "2147483648" })).toThrow();
+  const hints = config(h.bindings).hints;
+  hints[0] = "wnam";
+  expect(config(h.bindings).hints).toEqual(["apac", "me", "weur"]);
+});
+
 it("never exposes fault injection over HTTP", async () => {
   const h = await setup();
   expect((await worker.fetch(new Request("https://test/debug/fault"), h.bindings, h.ctx)).status).toBe(404);
