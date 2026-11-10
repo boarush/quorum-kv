@@ -61,11 +61,14 @@ it("routes an end-to-end request through the deployed module export", async () =
 
 it("reads its writes, with strictly increasing versions on sequential overwrites", async () => {
   const h = await setup();
+  let previous = 0;
   for (let i = 1; i <= 5; i++) {
     await h.kv.put(h.key, bytes(String(i)));
     expect(text(await h.kv.get(h.key))).toBe(String(i));
+    await waitOnExecutionContext(h.ctx);
     const version = await h.replicas[0]!.stub.readVersion(h.key);
-    expect(version.counter).toBe(i);
+    expect(version.counter).toBeGreaterThan(previous);
+    previous = version.counter;
   }
 });
 
@@ -83,13 +86,15 @@ it("orders equal-counter versions by writer and ignores stale or duplicate write
 it("deletes with a versioned tombstone and permits recreation", async () => {
   const h = await setup();
   await h.kv.put(h.key, bytes("old"));
+  await waitOnExecutionContext(h.ctx);
+  const written = await h.replicas[0]!.stub.readVersion(h.key);
   await h.kv.delete(h.key);
   expect(await h.kv.get(h.key)).toBeNull();
   expect((await h.request()).status).toBe(404);
   await waitOnExecutionContext(h.ctx);
   const deleted = await h.replicas[0]!.stub.read(h.key);
   expect(deleted.value).toBeNull();
-  expect(deleted.version.counter).toBe(2);
+  expect(compare(deleted.version, written)).toBeGreaterThan(0);
   await h.kv.put(h.key, bytes("new"));
   expect(text(await h.kv.get(h.key))).toBe("new");
 });
@@ -97,6 +102,7 @@ it("deletes with a versioned tombstone and permits recreation", async () => {
 it("expires a value from its replicated deadline without a coordinator write", async () => {
   const h = await setup();
   await h.kv.put(h.key, bytes("short-lived"), { ttlSeconds: 0.05 });
+  await waitOnExecutionContext(h.ctx);
   const before = await h.replicas[0]!.stub.read(h.key);
   expect(before.expiresAt).not.toBeNull();
   await pause(100);
@@ -158,6 +164,28 @@ it("repairs a stale third replica when it participates in a read quorum", async 
   const records = await Promise.all(h.replicas.map(({ stub }) => stub.read(h.key)));
   expect(records.map(record => text(record.value))).toEqual(["repaired", "repaired", "repaired"]);
   expect(records.every(record => compare(record.version, records[0]!.version) === 0)).toBe(true);
+});
+
+it("lets a later completed write outrank an earlier partial write", async () => {
+  const h = await setup();
+  // A write that reached only one replica has a tag from before the later write.
+  await h.replicas[2]!.stub.write(h.key, {
+    value: bytes("partial"),
+    version: { counter: Date.now() - 60_000, writer: "z" },
+    expiresAt: null,
+    writtenAt: Date.now(),
+  });
+  await h.replicas[2]!.stub.setFault({ fail: true });
+  await h.kv.put(h.key, bytes("completed"));
+  await waitOnExecutionContext(h.ctx);
+  await h.replicas[2]!.stub.setFault({});
+  // Delay one replica so the read quorum includes the completed and partial copies.
+  await h.replicas[1]!.stub.setFault({ delayMs: 100 });
+  expect(text(await h.kv.get(h.key))).toBe("completed");
+  await waitOnExecutionContext(h.ctx);
+  await h.replicas[1]!.stub.setFault({});
+  const records = await Promise.all(h.replicas.map(({ stub }) => stub.read(h.key)));
+  expect(records.map(record => text(record.value))).toEqual(["completed", "completed", "completed"]);
 });
 
 it("repairs tombstones and expired records rather than resurrecting stale values", async () => {
@@ -306,6 +334,7 @@ it("keeps deleted and expired versions beyond grace while a replica is offline",
     const h = await setup();
     await h.kv.put(h.key, bytes("old"));
     await waitOnExecutionContext(h.ctx);
+    const oldVersion = await h.replicas[0]!.stub.readVersion(h.key);
     const missing = h.replicas[2]!.stub;
     await missing.setFault({ fail: true });
     if (expired) {
@@ -318,7 +347,7 @@ it("keeps deleted and expired versions beyond grace while a replica is offline",
     await ageGc(h.replicas.slice(0, 2));
     await syncRounds(h.replicas.slice(0, 2));
     for (const { stub } of h.replicas.slice(0, 2)) {
-      expect((await stub.readVersion(h.key)).counter).toBe(2);
+      expect(compare(await stub.readVersion(h.key), oldVersion)).toBeGreaterThan(0);
       expect((await stub.read(h.key)).value).toBeNull();
     }
     await missing.setFault({});

@@ -117,7 +117,8 @@ export class QuorumKV {
   private async store(key: string, value: ArrayBuffer | null, expiresAt: number | null) {
     const started = Date.now();
     const versions = await this.quorum(key, "version", stub => stub.readVersion(key));
-    const counter = Math.max(...versions.map(version => version.counter)) + 1;
+    // Wall-clock tags keep an earlier partial write below a later completed one.
+    const counter = Math.max(Date.now(), ...versions.map(version => version.counter + 1));
     if (!Number.isSafeInteger(counter)) throw new QuorumUnavailable();
     const record: RecordValue = { value, version: { counter, writer: crypto.randomUUID() }, expiresAt };
     await this.quorum(key, "write", stub => stub.write(key, { ...record, writtenAt: started }));
