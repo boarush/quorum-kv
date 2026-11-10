@@ -1,6 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "./config";
 import { config } from "./config";
+import { replicaDebug, type ReplicaCommand } from "./testing";
 import { compare, EMPTY, type RecordValue, type Version } from "./model";
 
 type Row = {
@@ -217,6 +218,11 @@ export class Replica extends DurableObject<Env> {
     } finally {
       await this.schedule();
     }
+  }
+
+  async debug(command: ReplicaCommand) {
+    if (this.env.TESTING !== "true") throw new Error("Debug RPC is disabled");
+    return replicaDebug(this, this.ctx, command);
   }
 
   async setFault(fault: { delayMs?: number; fail?: boolean }): Promise<void> {

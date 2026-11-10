@@ -1,52 +1,26 @@
-import { env } from "cloudflare:workers";
 import {
-  SELF,
-  createExecutionContext,
-  evictDurableObject,
-  reset,
-  runDurableObjectAlarm,
-  runInDurableObject,
-  waitOnExecutionContext,
-} from "cloudflare:test";
-import { afterEach, expect, it } from "vitest";
-import worker from "../src/index";
-import type { Env } from "../src/config";
+  setup,
+  it,
+  expect,
+  drain,
+  deployedRequest,
+  request,
+  alarm,
+  age,
+  inspect,
+  evict,
+  productionUrl,
+} from "./harness";
 import { config } from "../src/config";
+import type { Env } from "../src/config";
 import { QuorumKV, QuorumUnavailable } from "../src/coordinator";
 import { compare, type RecordValue } from "../src/model";
 
-const contexts: ExecutionContext[] = [];
 const bytes = (value: string) => new TextEncoder().encode(value).buffer as ArrayBuffer;
 const text = (value: ArrayBuffer | null) =>
   value === null ? null : new TextDecoder().decode(value);
 const stamped = (record: RecordValue) => ({ ...record, writtenAt: Date.now() });
 const pause = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
-
-async function setup(overrides: Partial<Env> = {}) {
-  const bindings = { ...env, ...overrides } as Env;
-  const ctx = createExecutionContext();
-  contexts.push(ctx);
-  const kv = new QuorumKV(bindings, ctx);
-  const key = crypto.randomUUID();
-  const replicas = await kv.replicas(key);
-  return {
-    kv,
-    key,
-    ctx,
-    bindings,
-    replicas,
-    request: (method = "GET", body?: BodyInit, suffix = "", debug = false) =>
-      worker.fetch(
-        new Request(`https://test/kv/${key}${suffix}`, {
-          method,
-          body,
-          headers: debug ? { "X-KV-Debug": "1" } : {},
-        }),
-        bindings,
-        ctx,
-      ),
-  };
-}
 
 function repairFailingEnv(bindings: Env, failing: Set<string>): Env {
   const namespace = bindings.REPLICAS;
@@ -70,11 +44,6 @@ function repairFailingEnv(bindings: Env, failing: Set<string>): Env {
   } as Env;
 }
 
-afterEach(async () => {
-  await Promise.all(contexts.splice(0).map(ctx => waitOnExecutionContext(ctx)));
-  await reset();
-});
-
 it("roundtrips raw bytes and empty values through the Worker and real SQLite DOs", async () => {
   const h = await setup();
   const raw = new Uint8Array([0, 255, 128, 13, 10]);
@@ -90,10 +59,10 @@ it("roundtrips raw bytes and empty values through the Worker and real SQLite DOs
 });
 
 it("routes an end-to-end request through the deployed module export", async () => {
-  const key = crypto.randomUUID();
-  const put = await SELF.fetch(`https://test/kv/${key}`, { method: "PUT", body: "edge" });
+  const { key } = await setup();
+  const put = await deployedRequest(`/kv/${key}`, { method: "PUT", body: "edge" });
   expect(put.status).toBe(204);
-  const get = await SELF.fetch(`https://test/kv/${key}`);
+  const get = await deployedRequest(`/kv/${key}`);
   expect(text(await get.arrayBuffer())).toBe("edge");
 });
 
@@ -103,7 +72,7 @@ it("reads its writes, with strictly increasing versions on sequential overwrites
   for (let i = 1; i <= 5; i++) {
     await h.kv.put(h.key, bytes(String(i)));
     expect(text(await h.kv.get(h.key))).toBe(String(i));
-    await waitOnExecutionContext(h.ctx);
+    await drain(h.ctx);
     const version = await h.replicas[0]!.stub.readVersion(h.key);
     expect(version.counter).toBeGreaterThan(previous);
     previous = version.counter;
@@ -134,12 +103,12 @@ it("orders equal-counter versions by writer and ignores stale or duplicate write
 it("deletes with a versioned tombstone and permits recreation", async () => {
   const h = await setup();
   await h.kv.put(h.key, bytes("old"));
-  await waitOnExecutionContext(h.ctx);
+  await drain(h.ctx);
   const written = await h.replicas[0]!.stub.readVersion(h.key);
   await h.kv.delete(h.key);
   expect(await h.kv.get(h.key)).toBeNull();
   expect((await h.request()).status).toBe(404);
-  await waitOnExecutionContext(h.ctx);
+  await drain(h.ctx);
   const deleted = await h.replicas[0]!.stub.read(h.key);
   expect(deleted.value).toBeNull();
   expect(compare(deleted.version, written)).toBeGreaterThan(0);
@@ -150,7 +119,7 @@ it("deletes with a versioned tombstone and permits recreation", async () => {
 it("expires a value from its replicated deadline without a coordinator write", async () => {
   const h = await setup();
   await h.kv.put(h.key, bytes("short-lived"), { ttlSeconds: 0.05 });
-  await waitOnExecutionContext(h.ctx);
+  await drain(h.ctx);
   const before = await h.replicas[0]!.stub.read(h.key);
   expect(before.expiresAt).not.toBeNull();
   await pause(100);
@@ -221,7 +190,7 @@ it("rejects a read when the repair quorum is unavailable", async () => {
   );
   await expect(kv.get(h.key)).rejects.toBeInstanceOf(QuorumUnavailable);
   expect(kv.phases.map(phase => phase.name)).toEqual(["read", "repair"]);
-  await waitOnExecutionContext(h.ctx);
+  await drain(h.ctx);
   await h.replicas[2]!.stub.setFault({});
 });
 
@@ -238,13 +207,13 @@ it("repairs a stale third replica when it participates in a read quorum", async 
   const h = await setup();
   await h.replicas[2]!.stub.setFault({ fail: true });
   await h.kv.put(h.key, bytes("repaired"));
-  await waitOnExecutionContext(h.ctx);
+  await drain(h.ctx);
   await h.replicas[2]!.stub.setFault({});
   expect((await h.replicas[2]!.stub.readVersion(h.key)).counter).toBe(0);
   await h.replicas[1]!.stub.setFault({ delayMs: 100 });
   expect(text(await h.kv.get(h.key))).toBe("repaired");
   expect(h.kv.phases.at(-1)!.name).toBe("repair");
-  await waitOnExecutionContext(h.ctx);
+  await drain(h.ctx);
   const records = await Promise.all(h.replicas.map(({ stub }) => stub.read(h.key)));
   expect(records.map(record => text(record.value))).toEqual(["repaired", "repaired", "repaired"]);
   expect(records.every(record => compare(record.version, records[0]!.version) === 0)).toBe(true);
@@ -261,12 +230,12 @@ it("lets a later completed write outrank an earlier partial write", async () => 
   });
   await h.replicas[2]!.stub.setFault({ fail: true });
   await h.kv.put(h.key, bytes("completed"));
-  await waitOnExecutionContext(h.ctx);
+  await drain(h.ctx);
   await h.replicas[2]!.stub.setFault({});
   // Delay one replica so the read quorum includes the completed and partial copies.
   await h.replicas[1]!.stub.setFault({ delayMs: 100 });
   expect(text(await h.kv.get(h.key))).toBe("completed");
-  await waitOnExecutionContext(h.ctx);
+  await drain(h.ctx);
   await h.replicas[1]!.stub.setFault({});
   const records = await Promise.all(h.replicas.map(({ stub }) => stub.read(h.key)));
   expect(records.map(record => text(record.value))).toEqual([
@@ -300,7 +269,7 @@ it("repairs tombstones and expired records rather than resurrecting stale values
 it("concurrent writers converge to the maximum version on all three replicas", async () => {
   const h = await setup();
   await Promise.all(Array.from({ length: 12 }, (_, i) => h.kv.put(h.key, bytes(`writer-${i}`))));
-  await waitOnExecutionContext(h.ctx);
+  await drain(h.ctx);
   const records = await Promise.all(h.replicas.map(({ stub }) => stub.read(h.key)));
   expect(records.every(record => compare(record.version, records[0]!.version) === 0)).toBe(true);
   expect(records.every(record => text(record.value) === text(records[0]!.value))).toBe(true);
@@ -318,7 +287,7 @@ it("keeps SQL records across eviction and rejects late writes after restart", as
     expiresAt: null,
   };
   await stub.write(h.key, stamped(record));
-  await evictDurableObject(stub);
+  await evict(stub);
   await stub.write(
     h.key,
     stamped({ ...record, version: { counter: 1, writer: "z" }, value: bytes("late") }),
@@ -337,28 +306,20 @@ it("alarms remove expired payloads but retain versions until grace and both peer
       expiresAt: Date.now() + 60_000,
     }),
   );
-  await runInDurableObject(stub, async (instance, state) => {
-    state.storage.sql.exec(
-      "UPDATE records SET expires_at = ?, gc_at = ?",
-      Date.now() - 1,
-      Date.now() + 60_000,
-    );
-    await instance.alarm();
-    expect((await instance.read(h.key)).value).toBeNull();
-    expect((await instance.readVersion(h.key)).counter).toBe(7);
-    expect(await state.storage.getAlarm()).not.toBeNull();
-    state.storage.sql.exec("UPDATE records SET gc_at = ?", Date.now() - 1);
-  });
-  expect(await runDurableObjectAlarm(stub)).toBe(true);
+  await age(stub, { expiresAt: Date.now() - 1, gcAt: Date.now() + 60_000 });
+  await alarm(stub);
+  expect((await stub.read(h.key)).value).toBeNull();
+  expect((await stub.readVersion(h.key)).counter).toBe(7);
+  expect((await inspect(stub)).alarm).not.toBeNull();
+  await age(stub, { gcAt: Date.now() - 1 });
+  expect(await alarm(stub)).toBe(true);
   expect((await stub.readVersion(h.key)).counter).toBe(7);
   for (let round = 0; round < 2; round++) {
-    for (const peer of h.replicas.slice(1)) await runDurableObjectAlarm(peer.stub);
+    for (const peer of h.replicas.slice(1)) await alarm(peer.stub);
   }
-  await runDurableObjectAlarm(stub);
+  await alarm(stub);
   expect((await stub.readVersion(h.key)).counter).toBe(0);
-  await runInDurableObject(stub, async (_, state) => {
-    expect(await state.storage.getAlarm()).not.toBeNull();
-  });
+  expect((await inspect(stub)).alarm).not.toBeNull();
 });
 
 it("garbage-collects tombstones without extending grace on duplicate write-back", async () => {
@@ -370,25 +331,18 @@ it("garbage-collects tombstones without extending grace on duplicate write-back"
     expiresAt: null,
   };
   await stub.write(h.key, stamped(tombstone));
-  const readGc = () =>
-    runInDurableObject(
-      stub,
-      (_, state) =>
-        state.storage.sql.exec<{ gc_at: number }>("SELECT gc_at FROM records").one().gc_at,
-    );
+  const readGc = async () => (await inspect(stub)).rows[0]!.gc_at;
   const first = await readGc();
   await pause(5);
   await stub.write(h.key, stamped(tombstone));
   expect(await readGc()).toBe(first);
-  await runInDurableObject(stub, (_, state) => {
-    state.storage.sql.exec("UPDATE records SET gc_at = ?", Date.now() - 1);
-  });
-  await runDurableObjectAlarm(stub);
+  await age(stub, { gcAt: Date.now() - 1 });
+  await alarm(stub);
   expect((await stub.readVersion(h.key)).counter).toBe(2);
   for (let round = 0; round < 2; round++) {
-    for (const peer of h.replicas.slice(1)) await runDurableObjectAlarm(peer.stub);
+    for (const peer of h.replicas.slice(1)) await alarm(peer.stub);
   }
-  await runDurableObjectAlarm(stub);
+  await alarm(stub);
   expect((await stub.readVersion(h.key)).counter).toBe(0);
 });
 
@@ -412,13 +366,9 @@ it("rejects malformed input, unsupported methods, and oversized values", async (
   expect((await h.request("POST")).status).toBe(405);
   expect((await h.request("PUT", new Uint8Array(1024 * 1024 + 1))).status).toBe(413);
   for (const path of ["/kv/", "/kv/%XX", `/kv/${"k".repeat(1025)}`]) {
-    expect((await worker.fetch(new Request(`https://test${path}`), h.bindings, h.ctx)).status).toBe(
-      400,
-    );
+    expect((await request(path)).status).toBe(400);
   }
-  expect(
-    (await worker.fetch(new Request("https://test/elsewhere"), h.bindings, h.ctx)).status,
-  ).toBe(404);
+  expect((await request("/elsewhere")).status).toBe(404);
 });
 
 it("sets no-store on error responses", async () => {
@@ -462,30 +412,26 @@ it("bounds timer configuration and isolates the default hints", async () => {
   expect(config(h.bindings).hints).toEqual(["apac", "me", "weur"]);
 });
 
-it("never exposes fault injection over HTTP", async () => {
+it("gates debug routes on TESTING and validates fault injection", async () => {
   const h = await setup();
-  expect(
-    (await worker.fetch(new Request("https://test/debug/fault"), h.bindings, h.ctx)).status,
-  ).toBe(404);
-  await runInDurableObject(h.replicas[0]!.stub, async instance => {
-    await expect(instance.setFault({ delayMs: -1 })).rejects.toThrow();
-  });
+  expect((await request("/debug/fault")).status).toBe(404);
+  for (const path of ["/_debug/request", `/_debug/replica/${h.replicas[0]!.name}`]) {
+    expect((await fetch(`${productionUrl}${path}`, { method: "POST", body: "{}" })).status).toBe(
+      404,
+    );
+  }
+  await expect(h.replicas[0]!.stub.setFault({ delayMs: -1 })).rejects.toThrow();
 });
 
 async function ageGc(replicas: Awaited<ReturnType<QuorumKV["replicas"]>>) {
   for (const { stub } of replicas) {
-    await runInDurableObject(stub, (_, state) => {
-      state.storage.sql.exec(
-        "UPDATE records SET gc_at = ? WHERE gc_at IS NOT NULL",
-        Date.now() - 1,
-      );
-    });
+    await age(stub, { gcAt: Date.now() - 1 });
   }
 }
 
 async function syncRounds(replicas: Awaited<ReturnType<QuorumKV["replicas"]>>, rounds = 3) {
   for (let round = 0; round < rounds; round++) {
-    for (const { stub } of replicas) await runDurableObjectAlarm(stub);
+    for (const { stub } of replicas) await alarm(stub);
   }
 }
 
@@ -493,7 +439,7 @@ it("keeps deleted and expired versions beyond grace while a replica is offline",
   for (const expired of [false, true]) {
     const h = await setup();
     await h.kv.put(h.key, bytes("old"));
-    await waitOnExecutionContext(h.ctx);
+    await drain(h.ctx);
     const oldVersion = await h.replicas[0]!.stub.readVersion(h.key);
     const missing = h.replicas[2]!.stub;
     await missing.setFault({ fail: true });
@@ -503,7 +449,7 @@ it("keeps deleted and expired versions beyond grace while a replica is offline",
     } else {
       await h.kv.delete(h.key);
     }
-    await waitOnExecutionContext(h.ctx);
+    await drain(h.ctx);
     await ageGc(h.replicas.slice(0, 2));
     await syncRounds(h.replicas.slice(0, 2));
     for (const { stub } of h.replicas.slice(0, 2)) {
@@ -535,25 +481,16 @@ it("converges without reads using bounded batches and durable peer cursors", asy
       }),
     );
   }
-  await evictDurableObject(source);
-  await runDurableObjectAlarm(target);
-  await runInDurableObject(target, (_, state) => {
-    expect(
-      state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM records").one()
-        .count,
-    ).toBe(4);
-  });
-  await evictDurableObject(target);
-  await runDurableObjectAlarm(target);
-  await runDurableObjectAlarm(target);
+  await evict(source);
+  await alarm(target);
+  expect((await inspect(target)).rows).toHaveLength(4);
+  await evict(target);
+  await alarm(target);
+  await alarm(target);
   for (let i = 0; i < 11; i++) expect(text((await target.read(`key-${i}`)).value)).toBe(String(i));
-  await runInDurableObject(target, (_, state) => {
-    expect(
-      state.storage.sql
-        .exec<{ cursor: number }>("SELECT cursor FROM peers WHERE name = ?", h.replicas[0]!.name)
-        .one().cursor,
-    ).toBe(11);
-  });
+  expect(
+    (await inspect(target)).peers.find(peer => peer.name === h.replicas[0]!.name)!.cursor,
+  ).toBe(11);
 });
 
 it("acknowledges only applied batches on the following pull and keeps sequences after GC", async () => {
@@ -564,40 +501,36 @@ it("acknowledges only applied batches on the following pull and keeps sequences 
     stamped({ value: null, version: { counter: 1, writer: "delete" }, expiresAt: null }),
   );
   await ageGc(h.replicas.slice(0, 1));
-  for (const { stub } of h.replicas.slice(1)) await runDurableObjectAlarm(stub);
-  await runDurableObjectAlarm(source);
+  for (const { stub } of h.replicas.slice(1)) await alarm(stub);
+  await alarm(source);
   expect((await source.readVersion(h.key)).counter).toBe(1);
-  for (const { stub } of h.replicas.slice(1)) await runDurableObjectAlarm(stub);
-  await runDurableObjectAlarm(source);
+  for (const { stub } of h.replicas.slice(1)) await alarm(stub);
+  await alarm(source);
   expect((await source.readVersion(h.key)).counter).toBe(0);
-  await evictDurableObject(source);
+  await evict(source);
   await source.write(
     h.key,
     stamped({ value: bytes("new"), version: { counter: 2, writer: "new" }, expiresAt: null }),
   );
-  await runInDurableObject(source, (_, state) => {
-    expect(state.storage.sql.exec<{ seq: number }>("SELECT seq FROM records").one().seq).toBe(2);
-  });
+  expect((await inspect(source)).rows[0]!.seq).toBe(2);
 });
 
 it("rejects an old direct write after acknowledged GC", async () => {
   const h = await setup();
   await h.kv.put(h.key, bytes("old"));
-  await waitOnExecutionContext(h.ctx);
+  await drain(h.ctx);
   const stale = {
     ...(await h.replicas[0]!.stub.read(h.key)),
     writtenAt: Date.now() - config(h.bindings).gcGraceMs - 1000,
   };
   await h.kv.delete(h.key);
-  await waitOnExecutionContext(h.ctx);
+  await drain(h.ctx);
   await syncRounds(h.replicas);
   await ageGc(h.replicas);
   await syncRounds(h.replicas);
   for (const { stub } of h.replicas) {
     expect((await stub.readVersion(h.key)).counter).toBe(0);
-    await runInDurableObject(stub, async instance => {
-      await expect(instance.write(h.key, stale)).rejects.toThrow("Write exceeds GC grace");
-    });
+    await expect(stub.write(h.key, stale)).rejects.toThrow("Write exceeds GC grace");
     expect((await stub.read(h.key)).value).toBeNull();
   }
   expect(await h.kv.get(h.key)).toBeNull();
@@ -614,10 +547,10 @@ it("retries peer sync failures on later alarms without losing cursors", async ()
     }),
   );
   await h.replicas[0]!.stub.setFault({ fail: true });
-  await runDurableObjectAlarm(h.replicas[2]!.stub);
+  await alarm(h.replicas[2]!.stub);
   expect((await h.replicas[2]!.stub.readVersion(h.key)).counter).toBe(0);
   await h.replicas[0]!.stub.setFault({});
-  await runDurableObjectAlarm(h.replicas[2]!.stub);
+  await alarm(h.replicas[2]!.stub);
   expect(text((await h.replicas[2]!.stub.read(h.key)).value)).toBe("retry");
 });
 
@@ -632,8 +565,8 @@ it("syncs retained expired versions even when their deadline predates grace", as
       expiresAt: Date.now() - 2 * config(h.bindings).gcGraceMs,
     }),
   );
-  await runDurableObjectAlarm(source);
-  await runDurableObjectAlarm(h.replicas[2]!.stub);
+  await alarm(source);
+  await alarm(h.replicas[2]!.stub);
   const synced = await h.replicas[2]!.stub.read(h.key);
   expect(synced.version.counter).toBe(8);
   expect(synced.value).toBeNull();
@@ -671,14 +604,14 @@ it("bounds streamed bodies by actual bytes instead of trusting Content-Length", 
       controller.close();
     },
   });
-  const response = await worker.fetch(
-    new Request(`https://test/kv/${h.key}`, {
+  const response = await request(
+    `/kv/${h.key}`,
+    {
       method: "PUT",
       body,
       headers: { "Content-Length": "1" },
-    }),
+    },
     h.bindings,
-    h.ctx,
   );
   expect(response.status).toBe(413);
 });

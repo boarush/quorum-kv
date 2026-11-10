@@ -14,16 +14,18 @@
   },
   "devDependencies": {
     "@alchemy.run/cloudflare": "2.0.0-beta.85",
-    "@cloudflare/vitest-plugin": "^1.6.1",
+    "@alchemy.run/test": "2.0.0-beta.85",
     "@cloudflare/workers-types": "latest",
     "@effect/platform-node": "^4.1.2",
+    "@effect/vitest": "4.1.2",
     "@types/node": "^26.6.6",
     "alchemy": "2.0.0-beta.85",
     "effect": "^4.1.2",
     "oxfmt": "^0.78.0",
     "oxlint": "^1.93.0",
     "typescript": "latest",
-    "vitest": "^4.1.0"
+    "vitest": "5.0.4",
+    "ws": "8.22.2"
   },
   "engines": {
     "node": ">=24.11.1"
