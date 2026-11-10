@@ -5,8 +5,10 @@
   "scripts": {
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
-    "lint": "eslint . --max-warnings 0",
-    "check": "npm run typecheck && npm run lint && npm test",
+    "lint": "oxlint --deny-warnings",
+    "format": "oxfmt",
+    "format:check": "oxfmt --check",
+    "check": "npm run typecheck && npm run lint && npm run format:check && npm test",
     "dev": "alchemy dev",
     "deploy": "alchemy deploy"
   },
@@ -18,10 +20,9 @@
     "@types/node": "^26.6.6",
     "alchemy": "2.0.0-beta.85",
     "effect": "^4.1.2",
-    "eslint": "latest",
-    "jiti": "latest",
+    "oxfmt": "^0.78.0",
+    "oxlint": "^1.93.0",
     "typescript": "latest",
-    "typescript-eslint": "latest",
     "vitest": "^4.1.0"
   },
   "engines": {

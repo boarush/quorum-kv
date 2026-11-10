@@ -1,7 +1,12 @@
 import { env } from "cloudflare:workers";
 import {
-  SELF, createExecutionContext, evictDurableObject, reset, runDurableObjectAlarm,
-  runInDurableObject, waitOnExecutionContext,
+  SELF,
+  createExecutionContext,
+  evictDurableObject,
+  reset,
+  runDurableObjectAlarm,
+  runInDurableObject,
+  waitOnExecutionContext,
 } from "cloudflare:test";
 import { afterEach, expect, it } from "vitest";
 import worker from "../src/index";
@@ -12,7 +17,8 @@ import { compare, type RecordValue } from "../src/model";
 
 const contexts: ExecutionContext[] = [];
 const bytes = (value: string) => new TextEncoder().encode(value).buffer as ArrayBuffer;
-const text = (value: ArrayBuffer | null) => value === null ? null : new TextDecoder().decode(value);
+const text = (value: ArrayBuffer | null) =>
+  value === null ? null : new TextDecoder().decode(value);
 const stamped = (record: RecordValue) => ({ ...record, writtenAt: Date.now() });
 const pause = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -24,11 +30,21 @@ async function setup(overrides: Partial<Env> = {}) {
   const key = crypto.randomUUID();
   const replicas = await kv.replicas(key);
   return {
-    kv, key, ctx, bindings, replicas,
+    kv,
+    key,
+    ctx,
+    bindings,
+    replicas,
     request: (method = "GET", body?: BodyInit, suffix = "", debug = false) =>
-      worker.fetch(new Request(`https://test/kv/${key}${suffix}`, {
-        method, body, headers: debug ? { "X-KV-Debug": "1" } : {},
-      }), bindings, ctx),
+      worker.fetch(
+        new Request(`https://test/kv/${key}${suffix}`, {
+          method,
+          body,
+          headers: debug ? { "X-KV-Debug": "1" } : {},
+        }),
+        bindings,
+        ctx,
+      ),
   };
 }
 
@@ -45,7 +61,9 @@ function repairFailingEnv(bindings: Env, failing: Set<string>): Env {
         return {
           read: (key: string) => stub.read(key),
           readVersion: (key: string) => stub.readVersion(key),
-          write: async () => { throw new Error("Injected repair failure"); },
+          write: async () => {
+            throw new Error("Injected repair failure");
+          },
         } as unknown as ReturnType<Env["REPLICAS"]["get"]>;
       },
     } as unknown as Env["REPLICAS"],
@@ -95,10 +113,20 @@ it("reads its writes, with strictly increasing versions on sequential overwrites
 it("orders equal-counter versions by writer and ignores stale or duplicate writes", async () => {
   const h = await setup();
   const stub = h.replicas[0]!.stub;
-  const high: RecordValue = { value: bytes("high"), version: { counter: 4, writer: "z" }, expiresAt: null };
+  const high: RecordValue = {
+    value: bytes("high"),
+    version: { counter: 4, writer: "z" },
+    expiresAt: null,
+  };
   await stub.write(h.key, stamped(high));
-  await stub.write(h.key, stamped({ ...high, value: bytes("low"), version: { counter: 4, writer: "a" } }));
-  await stub.write(h.key, stamped({ ...high, value: bytes("older"), version: { counter: 3, writer: "zz" } }));
+  await stub.write(
+    h.key,
+    stamped({ ...high, value: bytes("low"), version: { counter: 4, writer: "a" } }),
+  );
+  await stub.write(
+    h.key,
+    stamped({ ...high, value: bytes("older"), version: { counter: 3, writer: "zz" } }),
+  );
   await stub.write(h.key, stamped({ ...high, value: bytes("duplicate") }));
   expect(text((await stub.read(h.key)).value)).toBe("high");
 });
@@ -174,8 +202,16 @@ it("returns 503 without quorum instead of serving a lone replica", async () => {
 
 it("rejects a read when the repair quorum is unavailable", async () => {
   const h = await setup();
-  const stale: RecordValue = { value: bytes("stale"), version: { counter: 1, writer: "a" }, expiresAt: null };
-  const fresh: RecordValue = { value: bytes("fresh"), version: { counter: 2, writer: "b" }, expiresAt: null };
+  const stale: RecordValue = {
+    value: bytes("stale"),
+    version: { counter: 1, writer: "a" },
+    expiresAt: null,
+  };
+  const fresh: RecordValue = {
+    value: bytes("fresh"),
+    version: { counter: 2, writer: "b" },
+    expiresAt: null,
+  };
   await h.replicas[0]!.stub.write(h.key, stamped(stale));
   await Promise.all(h.replicas.slice(1).map(({ stub }) => stub.write(h.key, stamped(fresh))));
   await h.replicas[2]!.stub.setFault({ delayMs: 100 });
@@ -233,13 +269,21 @@ it("lets a later completed write outrank an earlier partial write", async () => 
   await waitOnExecutionContext(h.ctx);
   await h.replicas[1]!.stub.setFault({});
   const records = await Promise.all(h.replicas.map(({ stub }) => stub.read(h.key)));
-  expect(records.map(record => text(record.value))).toEqual(["completed", "completed", "completed"]);
+  expect(records.map(record => text(record.value))).toEqual([
+    "completed",
+    "completed",
+    "completed",
+  ]);
 });
 
 it("repairs tombstones and expired records rather than resurrecting stale values", async () => {
   for (const expired of [false, true]) {
     const h = await setup();
-    const old: RecordValue = { value: bytes("old"), version: { counter: 1, writer: "a" }, expiresAt: null };
+    const old: RecordValue = {
+      value: bytes("old"),
+      version: { counter: 1, writer: "a" },
+      expiresAt: null,
+    };
     const latest: RecordValue = {
       value: expired ? bytes("expired") : null,
       version: { counter: 2, writer: "b" },
@@ -268,19 +312,37 @@ it("concurrent writers converge to the maximum version on all three replicas", a
 it("keeps SQL records across eviction and rejects late writes after restart", async () => {
   const h = await setup();
   const stub = h.replicas[0]!.stub;
-  const record: RecordValue = { value: bytes("durable"), version: { counter: 2, writer: "z" }, expiresAt: null };
+  const record: RecordValue = {
+    value: bytes("durable"),
+    version: { counter: 2, writer: "z" },
+    expiresAt: null,
+  };
   await stub.write(h.key, stamped(record));
   await evictDurableObject(stub);
-  await stub.write(h.key, stamped({ ...record, version: { counter: 1, writer: "z" }, value: bytes("late") }));
+  await stub.write(
+    h.key,
+    stamped({ ...record, version: { counter: 1, writer: "z" }, value: bytes("late") }),
+  );
   expect(text((await stub.read(h.key)).value)).toBe("durable");
 });
 
 it("alarms remove expired payloads but retain versions until grace and both peer acknowledgments", async () => {
   const h = await setup();
   const stub = h.replicas[0]!.stub;
-  await stub.write(h.key, stamped({ value: bytes("expires"), version: { counter: 7, writer: "a" }, expiresAt: Date.now() + 60_000 }));
+  await stub.write(
+    h.key,
+    stamped({
+      value: bytes("expires"),
+      version: { counter: 7, writer: "a" },
+      expiresAt: Date.now() + 60_000,
+    }),
+  );
   await runInDurableObject(stub, async (instance, state) => {
-    state.storage.sql.exec("UPDATE records SET expires_at = ?, gc_at = ?", Date.now() - 1, Date.now() + 60_000);
+    state.storage.sql.exec(
+      "UPDATE records SET expires_at = ?, gc_at = ?",
+      Date.now() - 1,
+      Date.now() + 60_000,
+    );
     await instance.alarm();
     expect((await instance.read(h.key)).value).toBeNull();
     expect((await instance.readVersion(h.key)).counter).toBe(7);
@@ -302,15 +364,25 @@ it("alarms remove expired payloads but retain versions until grace and both peer
 it("garbage-collects tombstones without extending grace on duplicate write-back", async () => {
   const h = await setup();
   const stub = h.replicas[0]!.stub;
-  const tombstone: RecordValue = { value: null, version: { counter: 2, writer: "d" }, expiresAt: null };
+  const tombstone: RecordValue = {
+    value: null,
+    version: { counter: 2, writer: "d" },
+    expiresAt: null,
+  };
   await stub.write(h.key, stamped(tombstone));
-  const readGc = () => runInDurableObject(stub, (_, state) =>
-    state.storage.sql.exec<{ gc_at: number }>("SELECT gc_at FROM records").one().gc_at);
+  const readGc = () =>
+    runInDurableObject(
+      stub,
+      (_, state) =>
+        state.storage.sql.exec<{ gc_at: number }>("SELECT gc_at FROM records").one().gc_at,
+    );
   const first = await readGc();
   await pause(5);
   await stub.write(h.key, stamped(tombstone));
   expect(await readGc()).toBe(first);
-  await runInDurableObject(stub, (_, state) => { state.storage.sql.exec("UPDATE records SET gc_at = ?", Date.now() - 1); });
+  await runInDurableObject(stub, (_, state) => {
+    state.storage.sql.exec("UPDATE records SET gc_at = ?", Date.now() - 1);
+  });
   await runDurableObjectAlarm(stub);
   expect((await stub.readVersion(h.key)).counter).toBe(2);
   for (let round = 0; round < 2; round++) {
@@ -340,9 +412,13 @@ it("rejects malformed input, unsupported methods, and oversized values", async (
   expect((await h.request("POST")).status).toBe(405);
   expect((await h.request("PUT", new Uint8Array(1024 * 1024 + 1))).status).toBe(413);
   for (const path of ["/kv/", "/kv/%XX", `/kv/${"k".repeat(1025)}`]) {
-    expect((await worker.fetch(new Request(`https://test${path}`), h.bindings, h.ctx)).status).toBe(400);
+    expect((await worker.fetch(new Request(`https://test${path}`), h.bindings, h.ctx)).status).toBe(
+      400,
+    );
   }
-  expect((await worker.fetch(new Request("https://test/elsewhere"), h.bindings, h.ctx)).status).toBe(404);
+  expect(
+    (await worker.fetch(new Request("https://test/elsewhere"), h.bindings, h.ctx)).status,
+  ).toBe(404);
 });
 
 it("sets no-store on error responses", async () => {
@@ -374,8 +450,11 @@ it("uses stable fixed shards, distinct hints, and validates topology configurati
 
 it("bounds timer configuration and isolates the default hints", async () => {
   const h = await setup();
-  expect(config({ ...h.bindings, LOCATION_HINTS: " apac , me , weur " }).hints)
-    .toEqual(["apac", "me", "weur"]);
+  expect(config({ ...h.bindings, LOCATION_HINTS: " apac , me , weur " }).hints).toEqual([
+    "apac",
+    "me",
+    "weur",
+  ]);
   expect(config({ ...h.bindings, REPLICA_TIMEOUT_MS: "2147483647" }).timeoutMs).toBe(2 ** 31 - 1);
   expect(() => config({ ...h.bindings, REPLICA_TIMEOUT_MS: "2147483648" })).toThrow();
   const hints = config(h.bindings).hints;
@@ -385,7 +464,9 @@ it("bounds timer configuration and isolates the default hints", async () => {
 
 it("never exposes fault injection over HTTP", async () => {
   const h = await setup();
-  expect((await worker.fetch(new Request("https://test/debug/fault"), h.bindings, h.ctx)).status).toBe(404);
+  expect(
+    (await worker.fetch(new Request("https://test/debug/fault"), h.bindings, h.ctx)).status,
+  ).toBe(404);
   await runInDurableObject(h.replicas[0]!.stub, async instance => {
     await expect(instance.setFault({ delayMs: -1 })).rejects.toThrow();
   });
@@ -394,7 +475,10 @@ it("never exposes fault injection over HTTP", async () => {
 async function ageGc(replicas: Awaited<ReturnType<QuorumKV["replicas"]>>) {
   for (const { stub } of replicas) {
     await runInDurableObject(stub, (_, state) => {
-      state.storage.sql.exec("UPDATE records SET gc_at = ? WHERE gc_at IS NOT NULL", Date.now() - 1);
+      state.storage.sql.exec(
+        "UPDATE records SET gc_at = ? WHERE gc_at IS NOT NULL",
+        Date.now() - 1,
+      );
     });
   }
 }
@@ -442,28 +526,43 @@ it("converges without reads using bounded batches and durable peer cursors", asy
   const source = h.replicas[0]!.stub;
   const target = h.replicas[2]!.stub;
   for (let i = 0; i < 11; i++) {
-    await source.write(`key-${i}`, stamped({
-      value: bytes(String(i)), version: { counter: 1, writer: "batch" }, expiresAt: null,
-    }));
+    await source.write(
+      `key-${i}`,
+      stamped({
+        value: bytes(String(i)),
+        version: { counter: 1, writer: "batch" },
+        expiresAt: null,
+      }),
+    );
   }
   await evictDurableObject(source);
   await runDurableObjectAlarm(target);
   await runInDurableObject(target, (_, state) => {
-    expect(state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM records").one().count).toBe(4);
+    expect(
+      state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM records").one()
+        .count,
+    ).toBe(4);
   });
   await evictDurableObject(target);
   await runDurableObjectAlarm(target);
   await runDurableObjectAlarm(target);
   for (let i = 0; i < 11; i++) expect(text((await target.read(`key-${i}`)).value)).toBe(String(i));
   await runInDurableObject(target, (_, state) => {
-    expect(state.storage.sql.exec<{ cursor: number }>("SELECT cursor FROM peers WHERE name = ?", h.replicas[0]!.name).one().cursor).toBe(11);
+    expect(
+      state.storage.sql
+        .exec<{ cursor: number }>("SELECT cursor FROM peers WHERE name = ?", h.replicas[0]!.name)
+        .one().cursor,
+    ).toBe(11);
   });
 });
 
 it("acknowledges only applied batches on the following pull and keeps sequences after GC", async () => {
   const h = await setup();
   const source = h.replicas[0]!.stub;
-  await source.write(h.key, stamped({ value: null, version: { counter: 1, writer: "delete" }, expiresAt: null }));
+  await source.write(
+    h.key,
+    stamped({ value: null, version: { counter: 1, writer: "delete" }, expiresAt: null }),
+  );
   await ageGc(h.replicas.slice(0, 1));
   for (const { stub } of h.replicas.slice(1)) await runDurableObjectAlarm(stub);
   await runDurableObjectAlarm(source);
@@ -472,7 +571,10 @@ it("acknowledges only applied batches on the following pull and keeps sequences 
   await runDurableObjectAlarm(source);
   expect((await source.readVersion(h.key)).counter).toBe(0);
   await evictDurableObject(source);
-  await source.write(h.key, stamped({ value: bytes("new"), version: { counter: 2, writer: "new" }, expiresAt: null }));
+  await source.write(
+    h.key,
+    stamped({ value: bytes("new"), version: { counter: 2, writer: "new" }, expiresAt: null }),
+  );
   await runInDurableObject(source, (_, state) => {
     expect(state.storage.sql.exec<{ seq: number }>("SELECT seq FROM records").one().seq).toBe(2);
   });
@@ -503,9 +605,14 @@ it("rejects an old direct write after acknowledged GC", async () => {
 
 it("retries peer sync failures on later alarms without losing cursors", async () => {
   const h = await setup();
-  await h.replicas[0]!.stub.write(h.key, stamped({
-    value: bytes("retry"), version: { counter: 1, writer: "retry" }, expiresAt: null,
-  }));
+  await h.replicas[0]!.stub.write(
+    h.key,
+    stamped({
+      value: bytes("retry"),
+      version: { counter: 1, writer: "retry" },
+      expiresAt: null,
+    }),
+  );
   await h.replicas[0]!.stub.setFault({ fail: true });
   await runDurableObjectAlarm(h.replicas[2]!.stub);
   expect((await h.replicas[2]!.stub.readVersion(h.key)).counter).toBe(0);
@@ -517,10 +624,14 @@ it("retries peer sync failures on later alarms without losing cursors", async ()
 it("syncs retained expired versions even when their deadline predates grace", async () => {
   const h = await setup();
   const source = h.replicas[0]!.stub;
-  await source.write(h.key, stamped({
-    value: bytes("expired"), version: { counter: 8, writer: "retained" },
-    expiresAt: Date.now() - 2 * config(h.bindings).gcGraceMs,
-  }));
+  await source.write(
+    h.key,
+    stamped({
+      value: bytes("expired"),
+      version: { counter: 8, writer: "retained" },
+      expiresAt: Date.now() - 2 * config(h.bindings).gcGraceMs,
+    }),
+  );
   await runDurableObjectAlarm(source);
   await runDurableObjectAlarm(h.replicas[2]!.stub);
   const synced = await h.replicas[2]!.stub.read(h.key);
@@ -560,8 +671,14 @@ it("bounds streamed bodies by actual bytes instead of trusting Content-Length", 
       controller.close();
     },
   });
-  const response = await worker.fetch(new Request(`https://test/kv/${h.key}`, {
-    method: "PUT", body, headers: { "Content-Length": "1" },
-  }), h.bindings, h.ctx);
+  const response = await worker.fetch(
+    new Request(`https://test/kv/${h.key}`, {
+      method: "PUT",
+      body,
+      headers: { "Content-Length": "1" },
+    }),
+    h.bindings,
+    h.ctx,
+  );
   expect(response.status).toBe(413);
 });

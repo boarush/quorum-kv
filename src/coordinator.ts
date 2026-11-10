@@ -4,7 +4,9 @@ import { compare, type RecordValue } from "./model";
 import type { Replica } from "./replica";
 
 export class QuorumUnavailable extends Error {
-  constructor() { super("Replica quorum unavailable"); }
+  constructor() {
+    super("Replica quorum unavailable");
+  }
 }
 
 export interface Answer {
@@ -45,7 +47,9 @@ export class QuorumKV {
   }
 
   private async quorum<T>(
-    key: string, name: string, call: (stub: DurableObjectStub<Replica>) => Promise<T>,
+    key: string,
+    name: string,
+    call: (stub: DurableObjectStub<Replica>) => Promise<T>,
   ): Promise<T[]> {
     const replicas = await this.replicas(key);
     const answers: Answer[] = [];
@@ -53,7 +57,7 @@ export class QuorumKV {
     this.phases.push({ name, answers });
     let failures = 0;
 
-    const attempts = replicas.map(async ({ name, stub }) => {
+    const attempts = replicas.map(async ({ name: replica, stub }) => {
       const start = Date.now();
       let timer: ReturnType<typeof setTimeout> | undefined;
       try {
@@ -63,7 +67,7 @@ export class QuorumKV {
             timer = setTimeout(() => reject(new Error("Replica timeout")), this.options.timeoutMs);
           }),
         ]);
-        return { value, answer: { replica: name, latencyMs: Date.now() - start } };
+        return { value, answer: { replica, latencyMs: Date.now() - start } };
       } finally {
         clearTimeout(timer);
       }
@@ -72,14 +76,17 @@ export class QuorumKV {
     this.ctx.waitUntil(Promise.allSettled(attempts).then(() => undefined));
     return new Promise<T[]>((resolve, reject) => {
       for (const attempt of attempts) {
-        void attempt.then(result => {
-          if (values.length === 2 || failures === 2) return;
-          values.push(result.value);
-          answers.push(result.answer);
-          if (values.length === 2) resolve(values);
-        }, () => {
-          if (++failures === 2 && values.length < 2) reject(new QuorumUnavailable());
-        });
+        void attempt.then(
+          result => {
+            if (values.length === 2 || failures === 2) return;
+            values.push(result.value);
+            answers.push(result.answer);
+            if (values.length === 2) resolve(values);
+          },
+          () => {
+            if (++failures === 2 && values.length < 2) reject(new QuorumUnavailable());
+          },
+        );
       }
     });
   }
@@ -103,8 +110,12 @@ export class QuorumKV {
       throw new RangeError(`Value exceeds ${this.options.maxValueBytes} bytes`);
     }
     const ttl = options.ttlSeconds;
-    if (ttl !== undefined && (!Number.isFinite(ttl) || ttl <= 0 ||
-      !Number.isSafeInteger(Math.ceil(Date.now() + ttl * 1000 + this.options.gcGraceMs)))) {
+    if (
+      ttl !== undefined &&
+      (!Number.isFinite(ttl) ||
+        ttl <= 0 ||
+        !Number.isSafeInteger(Math.ceil(Date.now() + ttl * 1000 + this.options.gcGraceMs)))
+    ) {
       throw new RangeError("ttlSeconds must be a positive finite duration");
     }
     await this.store(key, value, ttl === undefined ? null : Date.now() + ttl * 1000);
@@ -120,7 +131,11 @@ export class QuorumKV {
     // Wall-clock tags keep an earlier partial write below a later completed one.
     const counter = Math.max(Date.now(), ...versions.map(version => version.counter + 1));
     if (!Number.isSafeInteger(counter)) throw new QuorumUnavailable();
-    const record: RecordValue = { value, version: { counter, writer: crypto.randomUUID() }, expiresAt };
+    const record: RecordValue = {
+      value,
+      version: { counter, writer: crypto.randomUUID() },
+      expiresAt,
+    };
     await this.quorum(key, "write", stub => stub.write(key, { ...record, writtenAt: started }));
   }
 }

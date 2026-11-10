@@ -31,17 +31,20 @@ export function positiveInteger(
 ): number {
   const n = value === undefined ? fallback : Number(value);
   if (!Number.isSafeInteger(n) || n <= 0 || n > max) {
-    throw new Error(max === Number.MAX_SAFE_INTEGER
-      ? "Expected a positive safe integer"
-      : `Expected a positive safe integer no greater than ${max}`);
+    throw new Error(
+      max === Number.MAX_SAFE_INTEGER
+        ? "Expected a positive safe integer"
+        : `Expected a positive safe integer no greater than ${max}`,
+    );
   }
   return n;
 }
 
 export function config(env: Env) {
-  const hints = env.LOCATION_HINTS === undefined
-    ? [...DEFAULTS.hints]
-    : env.LOCATION_HINTS.split(",").map(hint => hint.trim());
+  const hints =
+    env.LOCATION_HINTS === undefined
+      ? [...DEFAULTS.hints]
+      : env.LOCATION_HINTS.split(",").map(hint => hint.trim());
   const allowed = new Set(["wnam", "enam", "sam", "weur", "eeur", "apac", "oc", "afr", "me"]);
   if (hints.length !== 3 || new Set(hints).size !== 3 || hints.some(hint => !allowed.has(hint))) {
     throw new Error("LOCATION_HINTS must contain three distinct supported location hints");

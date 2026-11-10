@@ -31,9 +31,10 @@ export default {
       switch (request.method) {
         case "GET": {
           const value = await kv.get(key);
-          response = value === null
-            ? noStore("Not found", { status: 404 })
-            : noStore(value, { headers: { "Content-Type": "application/octet-stream" } });
+          response =
+            value === null
+              ? noStore("Not found", { status: 404 })
+              : noStore(value, { headers: { "Content-Type": "application/octet-stream" } });
           break;
         }
         case "PUT": {
@@ -56,7 +57,10 @@ export default {
           }
           const value = new Uint8Array(length);
           let offset = 0;
-          for (const chunk of chunks) { value.set(chunk, offset); offset += chunk.byteLength; }
+          for (const chunk of chunks) {
+            value.set(chunk, offset);
+            offset += chunk.byteLength;
+          }
           const ttl = url.searchParams.get("ttl");
           await kv.put(key, value.buffer, { ttlSeconds: ttl === null ? undefined : Number(ttl) });
           response = noStore(null, { status: 204 });
