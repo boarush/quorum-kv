@@ -345,6 +345,23 @@ it("rejects malformed input, unsupported methods, and oversized values", async (
   expect((await worker.fetch(new Request("https://test/elsewhere"), h.bindings, h.ctx)).status).toBe(404);
 });
 
+it("sets no-store on error responses", async () => {
+  const h = await setup();
+  const ttl = await h.request("PUT", "bad", "?ttl=0");
+  expect(ttl.status).toBe(400);
+  expect(ttl.headers.get("Cache-Control")).toBe("no-store");
+  const method = await h.request("POST");
+  expect(method.status).toBe(405);
+  expect(method.headers.get("Cache-Control")).toBe("no-store");
+  const oversized = await h.request("PUT", new Uint8Array(1024 * 1024 + 1));
+  expect(oversized.status).toBe(413);
+  expect(oversized.headers.get("Cache-Control")).toBe("no-store");
+  await Promise.all(h.replicas.slice(0, 2).map(({ stub }) => stub.setFault({ fail: true })));
+  const unavailable = await h.request();
+  expect(unavailable.status).toBe(503);
+  expect(unavailable.headers.get("Cache-Control")).toBe("no-store");
+});
+
 it("uses stable fixed shards, distinct hints, and validates topology configuration", async () => {
   const h = await setup();
   expect((await h.kv.replicas(h.key)).map(r => r.name)).toEqual(h.replicas.map(r => r.name));
