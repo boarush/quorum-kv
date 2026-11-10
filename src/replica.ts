@@ -1,4 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
+import { RecordCache } from "./cache";
 import type { Env } from "./config";
 import { config } from "./config";
 import { replicaDebug, type ReplicaCommand } from "./testing";
@@ -23,12 +24,14 @@ const recordValue = (row: Row): RecordValue => ({
 export class Replica extends DurableObject<Env> {
   private fault = { delayMs: 0, fail: false };
   private readonly options;
+  private readonly cache: RecordCache;
   private readonly name: string;
   private readonly peers: { name: string; stub: DurableObjectStub<Replica> }[];
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.options = config(env);
+    this.cache = new RecordCache(this.options.cacheBytes);
     // Named RPCs and their alarms preserve ctx.id.name in the current runtime.
     const name = ctx.id.name;
     if (!name || !/^shard-\d+-r[012]$/.test(name))
@@ -79,10 +82,14 @@ export class Replica extends DurableObject<Env> {
   }
 
   private stored(key: string): RecordValue {
+    const cached = this.cache.get(key);
+    if (cached !== undefined) return cached;
     const row = this.ctx.storage.sql
       .exec<Row>("SELECT * FROM records WHERE key = ?", key)
       .toArray()[0];
-    return row ? recordValue(row) : EMPTY;
+    const record = row ? recordValue(row) : EMPTY;
+    this.cache.set(key, record);
+    return record;
   }
 
   async readVersion(key: string): Promise<Version> {
@@ -95,8 +102,8 @@ export class Replica extends DurableObject<Env> {
     return this.stored(key);
   }
 
-  private apply(key: string, record: RecordValue): void {
-    if (compare(record.version, this.stored(key).version) <= 0) return;
+  private apply(key: string, record: RecordValue): boolean {
+    if (compare(record.version, this.stored(key).version) <= 0) return false;
     const gcAt =
       record.expiresAt !== null
         ? record.expiresAt + this.options.gcGraceMs
@@ -118,6 +125,7 @@ export class Replica extends DurableObject<Env> {
       gcAt,
       seq,
     );
+    return true;
   }
 
   async write(key: string, record: RecordValue & { writtenAt: number }): Promise<void> {
@@ -129,7 +137,17 @@ export class Replica extends DurableObject<Env> {
       throw new RangeError("Write exceeds GC grace");
     }
     // Sequence allocation and visibility are atomic; sync uses the same version guard.
-    this.ctx.storage.transactionSync(() => this.apply(key, record));
+    let applied = false;
+    this.ctx.storage.transactionSync(() => {
+      applied = this.apply(key, record);
+    });
+    if (applied) {
+      this.cache.set(key, {
+        value: record.value,
+        version: record.version,
+        expiresAt: record.expiresAt,
+      });
+    }
     await this.schedule();
   }
 
@@ -175,15 +193,19 @@ export class Replica extends DurableObject<Env> {
           timer = setTimeout(() => reject(new Error("Sync timeout")), this.options.timeoutMs);
         }),
       ]);
+      const applied: { key: string; record: RecordValue }[] = [];
       this.ctx.storage.transactionSync(() => {
         // Held versions can be arbitrarily old. Only direct coordinator writes expire.
-        for (const { key, record } of batch.rows) this.apply(key, record);
+        for (const { key, record } of batch.rows) {
+          if (this.apply(key, record)) applied.push({ key, record });
+        }
         this.ctx.storage.sql.exec(
           "UPDATE peers SET cursor = ? WHERE name = ?",
           batch.cursor,
           peer.name,
         );
       });
+      for (const { key, record } of applied) this.cache.set(key, record);
     } finally {
       clearTimeout(timer);
     }
@@ -207,6 +229,18 @@ export class Replica extends DurableObject<Env> {
       await this.before();
       await Promise.allSettled(this.peers.map(peer => this.sync(peer)));
       const now = Date.now();
+      const expired = this.ctx.storage.sql
+        .exec<{ key: string }>(
+          "SELECT key FROM records WHERE expires_at <= ? AND value IS NOT NULL",
+          now,
+        )
+        .toArray();
+      const deleted = this.ctx.storage.sql
+        .exec<{ key: string }>(
+          "SELECT key FROM records WHERE gc_at <= ? AND seq <= (SELECT MIN(ack) FROM peers)",
+          now,
+        )
+        .toArray();
       this.ctx.storage.sql.exec(
         "UPDATE records SET value = NULL WHERE expires_at <= ? AND value IS NOT NULL",
         now,
@@ -215,6 +249,8 @@ export class Replica extends DurableObject<Env> {
         "DELETE FROM records WHERE gc_at <= ? AND seq <= (SELECT MIN(ack) FROM peers)",
         now,
       );
+      for (const { key } of expired) this.cache.delete(key);
+      for (const { key } of deleted) this.cache.delete(key);
     } finally {
       await this.schedule();
     }
@@ -222,7 +258,12 @@ export class Replica extends DurableObject<Env> {
 
   async debug(command: ReplicaCommand) {
     if (this.env.TESTING !== "true") throw new Error("Debug RPC is disabled");
+    if (command.action === "age") this.cache.clear();
     return replicaDebug(this, this.ctx, command);
+  }
+
+  cacheStats() {
+    return this.cache.stats();
   }
 
   async setFault(fault: { delayMs?: number; fail?: boolean }): Promise<void> {

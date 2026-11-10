@@ -16,7 +16,11 @@ const { test, beforeAll, afterAll, afterEach, deploy, destroy } = Test.make({
   dev: true,
 });
 const stage = process.env.ALCHEMY_TEST_STAGE ?? `test-${randomUUID().slice(0, 12)}`;
-const Stack = makeStack({ testing: true, port: randomInt(20_000, 60_000) });
+const cacheBytes =
+  process.env.REPLICA_CACHE_BYTES === undefined
+    ? undefined
+    : Number(process.env.REPLICA_CACHE_BYTES);
+const Stack = makeStack({ testing: true, port: randomInt(20_000, 60_000), cacheBytes });
 const GuardStack = makeStack({ port: randomInt(20_000, 60_000) });
 const deployed = beforeAll(deploy(Stack, { stage }));
 const guard = beforeAll(deploy(GuardStack, { stage: `${stage}-guard` }));

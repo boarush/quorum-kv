@@ -396,6 +396,9 @@ it("uses stable fixed shards, distinct hints, and validates topology configurati
   expect(() => config({ ...h.bindings, LOCATION_HINTS: "apac,apac,weur" })).toThrow();
   expect(() => config({ ...h.bindings, SHARDS: "0" })).toThrow();
   expect(() => config({ ...h.bindings, REPLICA_TIMEOUT_MS: "-1" })).toThrow();
+  expect(config(h.bindings).cacheBytes).toBe(0);
+  expect(config({ ...h.bindings, REPLICA_CACHE_BYTES: "0" }).cacheBytes).toBe(0);
+  expect(() => config({ ...h.bindings, REPLICA_CACHE_BYTES: "-1" })).toThrow();
 });
 
 it("bounds timer configuration and isolates the default hints", async () => {

@@ -9,6 +9,7 @@ export interface Env {
   SYNC_MS?: string;
   SYNC_BATCH?: string;
   MAX_VALUE_BYTES?: string;
+  REPLICA_CACHE_BYTES?: string;
   TESTING?: string;
 }
 
@@ -20,6 +21,7 @@ export const DEFAULTS = {
   syncMs: 30_000,
   syncBatch: 256,
   maxValueBytes: 1024 * 1024,
+  cacheBytes: 0,
 };
 
 const MAX_TIMER_MS = 2 ** 31 - 1;
@@ -36,6 +38,18 @@ export function positiveInteger(
         ? "Expected a positive safe integer"
         : `Expected a positive safe integer no greater than ${max}`,
     );
+  }
+  return n;
+}
+
+export function nonNegativeInteger(
+  value: string | undefined,
+  fallback: number,
+  max = Number.MAX_SAFE_INTEGER,
+): number {
+  const n = value === undefined ? fallback : Number(value);
+  if (!Number.isSafeInteger(n) || n < 0 || n > max) {
+    throw new Error(`Expected a non-negative safe integer no greater than ${max}`);
   }
   return n;
 }
@@ -57,5 +71,6 @@ export function config(env: Env) {
     syncMs: positiveInteger(env.SYNC_MS, DEFAULTS.syncMs),
     syncBatch: positiveInteger(env.SYNC_BATCH, DEFAULTS.syncBatch),
     maxValueBytes: positiveInteger(env.MAX_VALUE_BYTES, DEFAULTS.maxValueBytes),
+    cacheBytes: nonNegativeInteger(env.REPLICA_CACHE_BYTES, DEFAULTS.cacheBytes),
   };
 }

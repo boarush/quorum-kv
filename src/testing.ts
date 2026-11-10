@@ -7,7 +7,7 @@ export type ReplicaCommand =
   | { action: "read" | "readVersion"; key: string }
   | { action: "write"; key: string; record: RecordValue & { writtenAt: number } }
   | { action: "fault"; fault: { delayMs?: number; fail?: boolean } }
-  | { action: "alarm" | "inspect" | "evict" }
+  | { action: "alarm" | "inspect" | "evict" | "cache" }
   | { action: "age"; expiresAt?: number; gcAt?: number };
 
 // Preserve binary records across the test-only JSON bridge.
@@ -44,6 +44,8 @@ export async function replicaDebug(
       await instance.alarm();
       return true;
     }
+    case "cache":
+      return instance.cacheStats();
     case "inspect":
       return {
         rows: state.storage.sql

@@ -3,7 +3,9 @@ import * as Cloudflare from "@alchemy.run/cloudflare";
 import * as Effect from "effect/Effect";
 import type { Replica } from "./src/replica";
 
-export const makeStack = (options: { testing?: boolean; port?: number } = {}) =>
+export const makeStack = (
+  options: { testing?: boolean; port?: number; cacheBytes?: number } = {},
+) =>
   Alchemy.Stack(
     "quorum-kv",
     {
@@ -18,6 +20,9 @@ export const makeStack = (options: { testing?: boolean; port?: number } = {}) =>
         env: {
           REPLICAS: Cloudflare.DurableObject<Replica>("Replica"),
           ...(options.testing ? { TESTING: "true", SYNC_BATCH: "4" } : {}),
+          ...(options.cacheBytes === undefined
+            ? {}
+            : { REPLICA_CACHE_BYTES: String(options.cacheBytes) }),
         },
       });
       return { url: worker.url };
