@@ -8,7 +8,7 @@ export const makeStack = (options: { testing?: boolean; port?: number } = {}) =>
     "quorum-kv",
     {
       providers: Cloudflare.providers(),
-      state: Alchemy.localState(),
+      state: Cloudflare.state(),
     },
     Effect.gen(function* () {
       const worker = yield* Cloudflare.Worker("Api", {
