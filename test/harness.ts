@@ -50,6 +50,11 @@ function remoteReplica(name: string) {
   return {
     read: (key: string): Promise<RecordValue> => command(name, { action: "read", key }),
     readVersion: (key: string): Promise<Version> => command(name, { action: "readVersion", key }),
+    pull: (
+      fromPeer: string,
+      cursor: number,
+    ): Promise<{ rows: { key: string; record: RecordValue }[]; cursor: number }> =>
+      command(name, { action: "pull", fromPeer, cursor }),
     write: (key: string, record: RecordValue & { writtenAt: number }): Promise<void> =>
       command(name, { action: "write", key, record }),
     setFault: (fault: { delayMs?: number; fail?: boolean }): Promise<void> =>
@@ -148,6 +153,13 @@ export const inspect = (stub: DurableObjectStub<Replica>) =>
     rows: { key: string; gc_at: number | null; seq: number; counter: number }[];
     peers: { name: string; cursor: number; ack: number }[];
     alarm: number | null;
+  }>;
+export const expirationPlans = (stub: DurableObjectStub<Replica>) =>
+  stub.debug({ action: "expirationPlans" }) as Promise<{
+    next: number | null;
+    rowsRead: number;
+    schedule: { detail: string }[];
+    cleanup: { detail: string }[];
   }>;
 export async function evict(stub: DurableObjectStub<Replica>) {
   // ctx.abort() deliberately rejects the in-flight RPC after storage.sync().

@@ -8,6 +8,7 @@ import {
   alarm,
   age,
   inspect,
+  expirationPlans,
   evict,
   productionUrl,
 } from "./harness";
@@ -491,6 +492,114 @@ it("converges without reads using bounded batches and durable peer cursors", asy
   expect(
     (await inspect(target)).peers.find(peer => peer.name === h.replicas[0]!.name)!.cursor,
   ).toBe(11);
+});
+
+it("recovers a large-value backlog across byte-bounded batches and durable cursors", async () => {
+  const h = await setup();
+  const source = h.replicas[0]!.stub;
+  const target = h.replicas[2]!.stub;
+  // Include a supported SQLite row larger than the batch budget after copy overhead,
+  // plus empty values and tombstones. None may stall or be skipped by pagination.
+  const sizes = [1024 * 1024, 1024 * 1024, 3 * 1024 * 1024, 1024 * 1024, 0, null];
+  for (const [i, size] of sizes.entries()) {
+    await source.write(
+      `large-${i}`,
+      stamped({
+        value: size === null ? null : new Uint8Array(size).fill(i).buffer,
+        version: { counter: 1, writer: "large" },
+        expiresAt: null,
+      }),
+    );
+  }
+  await evict(source);
+  let cursor = 0;
+  let rounds = 0;
+  for (; rounds < sizes.length && cursor < sizes.length; rounds++) {
+    const batch = await source.pull(h.replicas[2]!.name, cursor);
+    expect(batch.rows.length).toBeGreaterThan(0);
+    const batchBytes = batch.rows.reduce(
+      (sum, { key, record }) =>
+        sum +
+        2 * (record.value?.byteLength ?? 0) +
+        2 * (key.length + record.version.writer.length) +
+        256,
+      0,
+    );
+    if (batchBytes > 4 * 1024 * 1024) expect(batch.rows).toHaveLength(1);
+    expect(batch.cursor).toBeGreaterThan(cursor);
+    await alarm(target);
+    const applied = await inspect(target);
+    expect(applied.peers.find(peer => peer.name === h.replicas[0]!.name)!.cursor).toBe(
+      batch.cursor,
+    );
+    expect(applied.rows).toHaveLength(batch.cursor);
+    cursor = batch.cursor;
+    if (rounds === 0) {
+      expect(cursor).toBe(1); // Byte budget, not the test stack's four-row limit.
+      await evict(target);
+    }
+  }
+  expect(cursor).toBe(sizes.length);
+  expect(rounds).toBeGreaterThan(2);
+  expect(await source.pull(h.replicas[2]!.name, cursor)).toEqual({ rows: [], cursor });
+  for (const [i, size] of sizes.entries()) {
+    const record = await target.read(`large-${i}`);
+    expect(record.version.counter).toBe(1);
+    if (size === null) expect(record.value).toBeNull();
+    else {
+      expect(record.value!.byteLength).toBe(size);
+      expect(new Uint8Array(record.value!).every(byte => byte === i)).toBe(true);
+    }
+  }
+});
+
+it("indexes expiration scheduling and cleanup among many records without TTLs", async () => {
+  const h = await setup();
+  const stub = h.replicas[0]!.stub;
+  for (let i = 0; i < 256; i++) {
+    await stub.write(
+      `persistent-${i}`,
+      stamped({
+        value: bytes("persistent"),
+        version: { counter: 1, writer: "expiration" },
+        expiresAt: null,
+      }),
+    );
+  }
+  await evict(stub);
+  const plans = await expirationPlans(stub);
+  expect(plans.next).toBeNull();
+  expect(plans.rowsRead).toBeLessThanOrEqual(1);
+  for (const plan of [plans.schedule, plans.cleanup]) {
+    expect(plan.some(row => /SEARCH records USING INDEX expirations/.test(row.detail))).toBe(true);
+  }
+  const expiresAt = Date.now() + 5000;
+  await stub.write(
+    "expiring",
+    stamped({
+      value: bytes("temporary"),
+      version: { counter: 1, writer: "expiration" },
+      expiresAt,
+    }),
+  );
+  expect((await inspect(stub)).alarm).toBe(expiresAt);
+  const scheduled = await expirationPlans(stub);
+  expect(scheduled.next).toBe(expiresAt);
+  expect(scheduled.rowsRead).toBeLessThanOrEqual(1);
+  await stub.write(
+    "expiring",
+    stamped({
+      value: bytes("expired"),
+      version: { counter: 2, writer: "expiration" },
+      expiresAt: Date.now() - 1,
+    }),
+  );
+  await alarm(stub);
+  expect((await stub.read("expiring")).value).toBeNull();
+  expect((await stub.readVersion("expiring")).counter).toBe(2);
+  expect((await inspect(stub)).rows).toHaveLength(257);
+  expect(text((await stub.read("persistent-255")).value)).toBe("persistent");
+  expect((await expirationPlans(stub)).next).toBeNull();
 });
 
 it("acknowledges only applied batches on the following pull and keeps sequences after GC", async () => {

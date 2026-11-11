@@ -14,6 +14,9 @@ type Row = {
   seq: number;
 };
 
+// Leave ample headroom for concurrent pulls, RPC serialization, and SQLite buffers.
+const SYNC_BATCH_BYTES = 4 * 1024 * 1024;
+
 const recordValue = (row: Row): RecordValue => ({
   value: row.value,
   version: { counter: row.counter, writer: row.writer },
@@ -60,6 +63,9 @@ export class Replica extends DurableObject<Env> {
       sql.exec("UPDATE records SET seq = rowid");
     }
     sql.exec("CREATE INDEX IF NOT EXISTS changes ON records(seq)");
+    sql.exec(
+      "CREATE INDEX IF NOT EXISTS expirations ON records(expires_at) WHERE value IS NOT NULL",
+    );
     sql.exec(
       "CREATE TABLE IF NOT EXISTS sequence (id INTEGER PRIMARY KEY CHECK(id = 1), seq INTEGER NOT NULL)",
     );
@@ -150,17 +156,25 @@ export class Replica extends DurableObject<Env> {
       cursor,
       fromPeer,
     );
-    const rows = this.ctx.storage.sql
-      .exec<Row>(
-        "SELECT * FROM records WHERE seq > ? ORDER BY seq LIMIT ?",
-        cursor,
-        this.options.syncBatch,
-      )
-      .toArray();
-    return {
-      rows: rows.map(row => ({ key: row.key, record: recordValue(row) })),
-      cursor: rows.at(-1)?.seq ?? cursor,
-    };
+    const rows: { key: string; record: RecordValue }[] = [];
+    let bytes = 0;
+    // Iterate lazily: materializing the row limit first can exhaust DO memory.
+    for (const row of this.ctx.storage.sql.exec<Row>(
+      "SELECT * FROM records WHERE seq > ? ORDER BY seq LIMIT ?",
+      cursor,
+      this.options.syncBatch,
+    )) {
+      // Budget for a payload copy, UTF-16 strings, and per-record RPC metadata.
+      const size =
+        2 * (row.value?.byteLength ?? 0) + 2 * (row.key.length + row.writer.length) + 256;
+      // Always return at least one row, even if a configured value limit permits
+      // a row larger than the budget. A single row is bounded by SQLite's row limit.
+      if (rows.length > 0 && bytes + size > SYNC_BATCH_BYTES) break;
+      rows.push({ key: row.key, record: recordValue(row) });
+      bytes += size;
+      cursor = row.seq;
+    }
+    return { rows, cursor };
   }
 
   private async sync(peer: { name: string; stub: DurableObjectStub<Replica> }) {

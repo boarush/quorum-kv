@@ -7,7 +7,8 @@ export type ReplicaCommand =
   | { action: "read" | "readVersion"; key: string }
   | { action: "write"; key: string; record: RecordValue & { writtenAt: number } }
   | { action: "fault"; fault: { delayMs?: number; fail?: boolean } }
-  | { action: "alarm" | "inspect" | "evict" }
+  | { action: "alarm" | "inspect" | "evict" | "expirationPlans" }
+  | { action: "pull"; fromPeer: string; cursor: number }
   | { action: "age"; expiresAt?: number; gcAt?: number };
 
 // Preserve binary records across the test-only JSON bridge.
@@ -36,6 +37,26 @@ export async function replicaDebug(
       return instance.write(command.key, command.record);
     case "fault":
       return instance.setFault(command.fault);
+    case "pull":
+      return instance.pull(command.fromPeer, command.cursor);
+    case "expirationPlans": {
+      const now = Date.now();
+      // These are the scheduling and cleanup statements used by Replica.
+      const schedule =
+        "SELECT MIN(expires_at) AS next FROM records WHERE value IS NOT NULL AND expires_at > ?";
+      const cleanup = "UPDATE records SET value = NULL WHERE expires_at <= ? AND value IS NOT NULL";
+      const query = state.storage.sql.exec<{ next: number | null }>(schedule, now);
+      return {
+        next: query.one().next,
+        rowsRead: query.rowsRead,
+        schedule: state.storage.sql
+          .exec<{ detail: string }>(`EXPLAIN QUERY PLAN ${schedule}`, now)
+          .toArray(),
+        cleanup: state.storage.sql
+          .exec<{ detail: string }>(`EXPLAIN QUERY PLAN ${cleanup}`, now)
+          .toArray(),
+      };
+    }
     case "alarm": {
       const alarm = await state.storage.getAlarm();
       if (alarm === null) return false;
@@ -146,6 +167,8 @@ export async function debugFetch(
     const result = await stub.debug(parse(await request.text()) as ReplicaCommand);
     return noStore(stringify(result ?? null), { headers: { "Content-Type": "application/json" } });
   } catch (error) {
+    // Test-only HTTP boundary: malformed input and injected RPC failures must
+    // produce a non-success response, never fallback data or a successful parse.
     return noStore(error instanceof Error ? error.message : "Debug request failed", {
       status: 500,
     });
