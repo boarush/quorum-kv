@@ -1,29 +1,285 @@
-quorum-kv is a small binary KV prototype backed by three SQLite Durable Objects per shard. It implements ABD multi-writer registers, with no leader or CAS. Two reachable replicas serve reads and writes while one fails or stalls.
+# quorum-kv
 
-A SHA-256 key hash selects one of 1024 fixed shards. Replica names are `shard-<n>-r<i>`. Distinct placement hints default to apac, me, and weur; hints apply only when objects are first located and do not guarantee separate regions.
+A small binary key-value store where two of three replicas is always enough to read or write —
+no leader, no compare-and-swap, no extra coordination service.
 
-Writes query three versions, take the first two successful replies, and choose a counter at least one above the highest observed counter and no lower than the current wall clock, with a random writer ID as a tie-breaker. They then write to all three and wait for two acknowledgments. Deletes write a null tombstone. Reads query three full records and take two replies. Matching versions return immediately; differing versions require a quorum write-back of the newest record first. Each phase uses independent per-replica timeouts, defaulting to 1500 ms, and returns HTTP 503 without a quorum. Late requests continue in the background.
+quorum-kv is a prototype. Each key lives in exactly one shard, and each shard is three
+SQLite-backed Durable Objects, so the data is ordinary SQL until you ask it for quorum
+semantics. The consistency model is an ABD multi-writer register: every replica can accept a
+write, and version numbers let anyone figure out which write won.
 
-A normal read costs three DO RPCs and about one RTT to the second-fastest replica. Writes and deletes take six RPCs across two quorum RTTs; repaired reads also take six. This excludes Worker entry, object startup, storage, alarms, and queueing costs. There is no local-read lease. Each key is pinned to one three-DO shard, so its throughput is bounded by one DO rather than scaling across shards.
+The trade-off is deliberate. You get read and write availability while one replica is down or
+slow, and you pay for it with two round trips per write, no local-read lease, and a per-key
+throughput ceiling of roughly one Durable Object.
 
-`GET /kv/:key` returns raw bytes with 200, or 404 when absent, deleted, or expired. `PUT /kv/:key?ttl=seconds` accepts a raw binary body and returns 204. Positive fractional TTLs are supported. `DELETE /kv/:key` returns 204 even if already absent. Keys are URL-encoded UTF-8, up to 1024 bytes; values default to a 1 MiB limit, configurable with `MAX_VALUE_BYTES`. Oversized HTTP bodies return 413, and `QuorumKV.put` throws `RangeError` before replica RPCs. The HTTP layer counts streamed bytes rather than trusting `Content-Length`. The default leaves room for key and version metadata below the [documented 8 MB SQLite row limit](https://developers.cloudflare.com/durable-objects/platform/limits/index.md); larger overrides must leave that overhead too. Empty values are distinct from missing values. Set `X-KV-Debug: 1` to receive `X-KV-Quorum` with answering replica names and latency for each phase.
+## How the pieces fit together
 
-Run `npm ci`, then `npm run check` for TypeScript, Oxlint, Oxfmt, and the Vitest integration suite. Use `npm run format` to apply Oxfmt. `@alchemy.run/test/Vitest` deploys the Alchemy stack once per suite in local mode, drives real workerd SQLite Durable Objects over HTTP, and destroys the stack afterward. A second stack without test bindings verifies that debug routes return 404. Fixtures use distinct shards; programmatic coordinator tests use HTTP-backed replica adapters.
+A SHA-256 hash of the key picks one of 1024 fixed shards. Replica names follow the pattern
+`shard-<n>-r<i>`, and each replica can derive its siblings from its own name. The current
+runtime preserves `ctx.id.name` for named RPCs and alarms.
 
-The test stack explicitly sets `TESTING=true` and `SYNC_BATCH=4`. Only that binding enables `POST /_debug/replica/:name`, a fixed-command bridge for replica reads/writes, faults, alarm delivery, row/cursor inspection, pulls, expiration query plans, deadline aging, and eviction after durable storage sync. `POST /_debug/request` runs the HTTP handler with per-request timeout/value-limit overrides and reconstructs streamed bodies, including invalid Content-Length cases that HTTP clients reject on the wire. Production stack configuration omits `TESTING`; both the HTTP bridge and its DO RPC reject access without the exact `"true"` value.
+```mermaid
+flowchart LR
+    C[Client] -->|GET / PUT / DELETE| W["Worker<br/>coordinator"]
+    W -->|"SHA-256(key) mod 1024"| S["shard n"]
+    S --> R0["shard-n-r0<br/>apac"]
+    S --> R1["shard-n-r1<br/>me"]
+    S --> R2["shard-n-r2<br/>weur"]
+    R0 <-.->|"anti-entropy pull"| R1
+    R1 <-.->|"anti-entropy pull"| R2
+    R0 <-.->|"anti-entropy pull"| R2
+```
 
-`ALCHEMY_TEST_DEV=0 npm test` runs the same suite live with a configured Cloudflare profile; `ALCHEMY_TEST_DEV=1` forces local mode. The harness uses `dev: true` by default and takes URLs from stack outputs, not localhost constants. Live tests deploy a throwaway TESTING-enabled stage plus a guard stage and destroy both. Stage names are random unless `ALCHEMY_TEST_STAGE` is set; any explicit stage must also be throwaway. Never target an existing deployment or expose a TESTING-enabled stage to untrusted callers. Tight latency assertions require a test runner near the deployed Worker.
+The default placement hints are `apac`, `me`, and `weur`. They are only hints: they apply when
+an object is first located and do not guarantee that the three replicas live in separate
+regions. You can change them, but don't change the shard count, hash, replica names, or hint
+ordering of an existing deployment without a migration.
 
-Run `npm run dev` for Alchemy local development at http://localhost:31463. Override the local port with `PORT`. Alchemy keeps deployment state in the Cloudflare state store, so both local development and `npm run deploy` require a configured Cloudflare profile. On first use, `Cloudflare.state()` deploys or adopts the account-level `alchemy-state-store` Worker. Deployment is not part of the local test suite.
+## Request flows
 
-Runtime bindings `SHARDS`, `LOCATION_HINTS` (three comma-separated hints), `REPLICA_TIMEOUT_MS`, `GC_GRACE_MS`, `SYNC_MS`, `SYNC_BATCH`, and `MAX_VALUE_BYTES` override defaults. Set them consistently in the Alchemy Worker environment. Defaults live in `src/config.ts`. Do not change the shard count, hash, replica names, or hint ordering for an existing deployment without a migration.
+### Writing a value
 
-TTL deadlines travel with each versioned record. Reads hide expired records; expiration alone does not generate a write, though a read still repairs when the responding versions differ. Alarms discard expired payloads while retaining their version metadata. A partial expiration index supports both deadline scheduling and expired-payload cleanup without scanning non-TTL records, and a partial `gc_at` index keeps GC off a full scan. Expired payloads are cleared at their deadline or the next periodic alarm, whichever is sooner; tombstone GC also rides the periodic `SYNC_MS` alarm, so a larger `SYNC_MS` delays both. A tombstone or expired row is physically removed only after the default one-day GC grace and acknowledgments from both peers for that row's local sequence. Duplicate writes do not extend tombstone grace. A permanently dead peer blocks GC; replacing or wiping a replica requires a rebuild protocol that is not implemented.
+A write is two quorum phases. First the coordinator asks all three replicas for their current
+version and waits for two answers. Then it computes a new version, sends it to all three, and
+waits for two acknowledgments.
 
-Each named replica derives its siblings and placement hints from its shard name and configuration. The current runtime preserves `ctx.id.name` for named RPCs and alarms. Replicas pull changed rows from each sibling every `SYNC_MS` (default 30 seconds), including after writes, without waiting for client reads. Each pull returns up to `SYNC_BATCH` rows (default 256), built incrementally with a 4 MiB budget accounting for payload copies, strings, and metadata, leaving headroom for RPC serialization and concurrent peer pulls. Each peer sync stops after eight pulls, reaching 16 MiB of budgeted bytes, or exhausting a single shared `REPLICA_TIMEOUT_MS` deadline (default 1500 ms), whichever comes first. The final batch can exceed the cumulative byte quota. A single row exceeding that budget is returned alone so recovery always advances; its size remains bounded by SQLite's row limit. Every applied version receives a monotonically increasing durable local sequence. Applying a batch and advancing its cursor is atomic; the next pull acknowledges the previously applied batch. Failures and per-peer timeouts leave the current pull unapplied; earlier completed batches retain their durable cursor progress for later alarms. These per-alarm quotas bound backlog work so cleanup and rescheduling can proceed, but sustained writes can still outpace anti-entropy. Touched shards keep periodic alarms even when empty, so stale peers can recover without client traffic.
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant W as Coordinator
+    participant R0 as r0
+    participant R1 as r1
+    participant R2 as r2
 
-Linearizable registers assume durable replicas, intersecting quorums, and retained versions. Version counters are wall-clock milliseconds, bumped above any counter seen, so an earlier partial write cannot outrank a later completed write except within clock skew or the same clock tick. Coordinator write and repair RPCs stamp `writtenAt` at operation start; replicas reject a direct write older than their GC grace, including after GC. Repair carries the read's start time as `writtenAt` and does not mint a new version. Sync-applied rows bypass that age check because they already reside on a durable replica. Safe finite GC assumes bounded end-to-end operation and sync delays, clocks with bounded skew, and a grace much larger than replica timeouts and those bounds. In particular, an old read result must not be re-stamped by a repair after grace. A coordinator timeout does not cancel an already dispatched RPC. Arbitrarily stalled operations, unbounded clock skew, or replica data loss are outside this guarantee; there is no permanent per-key deletion watermark.
+    C->>W: PUT /kv/my-key
+    W->>R0: readVersion
+    W->>R1: readVersion
+    W->>R2: readVersion
+    Note over W: keep the first 2 replies
+    R0-->>W: counter
+    R1-->>W: counter
+    Note over W: counter = max(now, highest seen + 1)<br/>writer = random UUID
+    W->>R0: write(record)
+    W->>R1: write(record)
+    W->>R2: write(record)
+    Note over W: keep the first 2 acks
+    R0-->>W: ok
+    R2-->>W: ok
+    W-->>C: 204
+    Note over R1: the third request keeps<br/>running in the background
+```
 
-TTL uses wall clocks and assumes sufficiently synchronized Workers and replicas. Clock skew can change the visibility boundary around expiration. There are no multi-key transactions, snapshots, list operations, or exactly-once writes. A timed-out write can still commit, and concurrent writes select a single version rather than preserving every value. Requests are crash-fault tolerant, not Byzantine tolerant.
+The version counter is wall-clock milliseconds, but always at least one above the highest
+counter observed. A random writer ID breaks ties within the same millisecond. Deletes use the
+same path with a null tombstone as the value.
 
-The HTTP endpoint has no authentication. Keep it local or add access control before exposing a deployment. Local tests exercise failure and ordering behavior, not actual regional placement, network partitions, clock synchronization, or production latency.
+If two of the three replicas don't answer within the phase timeout, the request fails with
+HTTP 503. Requests that were already dispatched are not cancelled — they finish in the
+background, which is why a timed-out write can still commit.
+
+### Reading a value
+
+A read is usually one quorum round. If the two replies disagree on the version, the coordinator
+repairs the lagging replicas first, then answers.
+
+```mermaid
+flowchart TD
+    A["GET /kv/my-key"] --> B["Ask all 3 replicas,<br/>keep the first 2 full records"]
+    B --> C{"Versions match?"}
+    C -->|yes| D{"Expired?"}
+    C -->|no| E["Write the newest record back<br/>to all 3 replicas"]
+    E --> D
+    D -->|"yes"| G["404"]
+    D -->|"no"| V{"Value is null?<br/>(tombstone)"}
+    V -->|"yes"| G
+    V -->|"no"| F["200 + raw bytes"]
+    B -.->|"fewer than 2 replies"| H["503"]
+```
+
+Repairs reuse the version from the read instead of minting a new one, and they carry the
+read's _start_ time. That stamp matters: a stalled read can't come back later and pass old data
+off as fresh.
+
+Reads also hide expired records, including when only a timeout expired them. Expiration on its
+own never generates a write, but a read still repairs if the two replies disagree.
+
+### What a request costs
+
+| Operation              | DO RPCs | Quorum round trips                 |
+| ---------------------- | ------- | ---------------------------------- |
+| Normal read            | 3       | ~1 (to the second-fastest replica) |
+| Write / delete         | 6       | 2                                  |
+| Read that needs repair | 6       | 2                                  |
+
+Those counts exclude the Worker entry point, object startup, storage work, alarms, and queueing.
+There is no local-read lease, and because every key is pinned to a single three-replica shard,
+per-key throughput is bounded by one Durable Object rather than scaling with the shard count.
+
+## HTTP API
+
+| Method   | Path                   | Success          | Notes                                          |
+| -------- | ---------------------- | ---------------- | ---------------------------------------------- |
+| `GET`    | `/kv/:key`             | `200`, raw bytes | `404` when absent, deleted, or expired         |
+| `PUT`    | `/kv/:key?ttl=seconds` | `204`            | Raw binary body; positive fractional TTLs work |
+| `DELETE` | `/kv/:key`             | `204`            | Also succeeds when the key is already absent   |
+
+Keys are URL-encoded UTF-8 and capped at 1024 bytes. Values default to a 1 MiB limit and can be
+raised with `MAX_VALUE_BYTES`. A body over the limit returns `413`; `QuorumKV.put` throws a
+`RangeError` before any replica RPC happens. The HTTP layer counts streamed bytes rather than
+trusting `Content-Length`.
+
+The default value limit leaves room for key and version metadata under the
+[8 MB SQLite row limit](https://developers.cloudflare.com/durable-objects/platform/limits/index.md).
+If you raise it, leave that overhead in place. An empty value is a real value and is distinct
+from a missing key.
+
+Other responses: `400` for an invalid key encoding, bad key length, or invalid TTL, `405` for
+unsupported methods, and `503` when no quorum is available.
+
+## Seeing what happened
+
+Send `X-KV-Debug: 1` and the response includes `X-KV-Quorum`: JSON listing the replicas that
+answered and the latency of each phase. It is the quickest way to confirm which two replicas
+made a request succeed.
+
+## Configuration
+
+All of these are Worker environment bindings. Defaults live in `src/config.ts`, and overriding
+them in the Alchemy Worker environment keeps local and deployed behavior in sync.
+
+| Binding              | Default            | What it controls                                               |
+| -------------------- | ------------------ | -------------------------------------------------------------- |
+| `SHARDS`             | `1024`             | Number of key shards                                           |
+| `LOCATION_HINTS`     | `apac,me,weur`     | Three distinct placement hints, in replica order               |
+| `REPLICA_TIMEOUT_MS` | `1500`             | Per-phase, per-replica timeout; also the shared sync deadline  |
+| `GC_GRACE_MS`        | `86400000` (1 day) | Minimum age before a tombstone or expired row can be collected |
+| `SYNC_MS`            | `30000`            | Anti-entropy period, and how often the cleanup alarm runs      |
+| `SYNC_BATCH`         | `256`              | Rows per sync pull                                             |
+| `MAX_VALUE_BYTES`    | `1048576` (1 MiB)  | Largest accepted value                                         |
+
+## Expiration and garbage collection
+
+TTL deadlines travel with each versioned record, so every replica can hide expired data on its
+own. Expiring a value does not write anything; the row keeps its version metadata and simply
+loses its payload. A partial expiration index handles both deadline scheduling and payload
+cleanup without scanning non-TTL rows, and a partial `gc_at` index keeps collection off a full
+table scan.
+
+Payloads are cleared at their deadline or at the next periodic alarm, whichever comes first.
+Tombstone collection rides the same `SYNC_MS` alarm, so a larger `SYNC_MS` delays both.
+
+Rows are only physically deleted after the GC grace period _and_ acknowledgment from both peers
+that they have seen the row's local sequence. Duplicate writes don't extend tombstone grace. A
+peer that is down forever blocks collection for the rows it hasn't acknowledged; replacing or
+wiping a replica needs a rebuild protocol that doesn't exist yet.
+
+## Background sync (anti-entropy)
+
+Each replica pulls changed rows from its two siblings every `SYNC_MS` (30 seconds by default),
+including right after a write. Clients never have to trigger this.
+
+A pull returns at most `SYNC_BATCH` rows, assembled incrementally under a 4 MiB budget that
+accounts for payload copies, strings, and metadata — headroom for RPC serialization and for
+pulls running against both peers at once. Each peer's sync stops after eight pulls, 16 MiB of
+budgeted bytes, or one shared `REPLICA_TIMEOUT_MS` deadline, whichever comes first. A final
+batch may exceed the byte quota, and a single row bigger than the budget is returned alone so
+recovery still advances; its size is bounded by the SQLite row limit.
+
+Every applied version gets a monotonically increasing durable local sequence number. Applying
+a batch and advancing its cursor happen atomically, and the next pull acknowledges the
+previously applied batch. If a pull fails or times out, that batch stays unapplied, while
+earlier completed batches keep their durable progress for later alarms.
+
+Those per-alarm quotas bound backlog work so cleanup and rescheduling can continue, but
+sustained writes can still outrun anti-entropy. Shards that have been touched keep scheduling
+periodic alarms even when empty, so a stale peer can catch up without any client traffic.
+
+```mermaid
+flowchart LR
+    A["Alarm fires<br/>every SYNC_MS or at next TTL"] --> B["Pull from each peer<br/>≤ 8 pulls, 16 MiB, 1 timeout"]
+    B --> C["Drop payloads past their deadline"]
+    C --> D["Collect tombstones and<br/>expired rows past grace + peer acks"]
+    D --> E["Schedule the next alarm"]
+```
+
+## What the consistency guarantee actually covers
+
+The register is linearizable as long as you keep these assumptions:
+
+- Replicas are durable, quorums intersect, and versions are retained.
+- Clocks are roughly synchronized and end-to-end operation plus sync delays are bounded.
+- The GC grace is much larger than replica timeouts and those bounds.
+
+Versions are wall-clock milliseconds bumped above anything already seen, so an earlier partial
+write can't outrank a later completed one — except within clock skew or within the same clock
+tick. Coordinator writes and repairs stamp `writtenAt` when the operation starts, and replicas
+reject a direct write older than their GC grace, even after GC. Repairs carry the read's start
+time and never mint a new version. Rows applied by sync skip the age check because they already
+live on a durable replica.
+
+The main thing to watch is that an old read result must never be re-stamped by a repair after
+the grace period has passed. A coordinator timeout doesn't cancel an RPC that already left, so
+arbitrarily stalled operations, unbounded clock skew, or replica data loss are outside the
+guarantee. There is also no permanent per-key deletion watermark.
+
+And the usual small-store caveats: no multi-key transactions, snapshots, list operations, or
+exactly-once writes. A timed-out write can still commit, and concurrent writes pick a single
+winner rather than preserving every value. Requests tolerate crash faults, not Byzantine ones.
+
+TTL is wall-clock based too, so clock skew between Workers and replicas can move the visibility
+boundary around an expiration.
+
+## Development
+
+```sh
+npm ci
+npm run check        # TypeScript, Oxlint, Oxfmt check, and the Vitest suite
+npm run format       # apply Oxfmt
+```
+
+`npm run check` runs the real thing: `@alchemy.run/test/Vitest` deploys the Alchemy stack once
+per suite in local mode, drives actual workerd SQLite Durable Objects over HTTP, and tears the
+stack down afterward. A second stack without test bindings verifies that the debug routes
+return 404. Fixtures use distinct shards, and coordinator tests use HTTP-backed replica
+adapters.
+
+### The test-only debug bridge
+
+The test stack sets `TESTING=true` and `SYNC_BATCH=4`. Only that binding enables
+`POST /_debug/replica/:name`, a fixed-command bridge for replica reads, writes, faults, alarm
+delivery, row and cursor inspection, pulls, expiration query plans, deadline aging, and eviction
+after a durable storage sync. There is also `POST /_debug/request`, which runs the HTTP handler
+with per-request timeout and value-limit overrides and can reconstruct streamed bodies —
+including deliberately false `Content-Length` values that HTTP clients won't send on the wire.
+
+Production configuration omits `TESTING` entirely, and both the HTTP bridge and its Durable
+Object RPC reject anything other than the exact string `"true"`.
+
+### Running tests against the real thing
+
+`ALCHEMY_TEST_DEV=0 npm test` runs the same suite live against a configured Cloudflare
+profile; `ALCHEMY_TEST_DEV=1` forces local mode. The harness defaults to `dev: true` and reads
+URLs from stack outputs instead of assuming localhost. Live runs deploy a throwaway
+`TESTING`-enabled stage plus a guard stage, then destroy both. Stage names are random unless
+`ALCHEMY_TEST_STAGE` is set, and any stage you pass explicitly must still be disposable.
+
+Never point a test run at an existing deployment, and never expose a `TESTING`-enabled stage to
+untrusted callers. Tight latency assertions also want a test runner physically near the
+deployed Worker.
+
+## Running and deploying
+
+`npm run dev` starts Alchemy local development at <http://localhost:31463>; override the port
+with `PORT`. Alchemy keeps deployment state in the Cloudflare state store, so both local
+development and `npm run deploy` need a configured Cloudflare profile. On first use,
+`Cloudflare.state()` deploys or adopts the account-level `alchemy-state-store` Worker.
+Deployment is not part of the local test suite.
+
+## Please don't ship this as-is
+
+The HTTP endpoint has no authentication. Keep it local, or put access control in front of it
+before exposing a deployment.
+
+The local tests exercise failure and ordering behavior — not real regional placement, network
+partitions, clock synchronization, or production latency.
