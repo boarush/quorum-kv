@@ -484,10 +484,14 @@ it("converges without reads using bounded batches and durable peer cursors", asy
     );
   }
   await evict(source);
+  // A pull that fills the row limit reports more, so one alarm drains every batch.
+  // Pull as the other peer so the target's own cursor stays untouched.
+  const first = await source.pull(h.replicas[1]!.name, 0);
+  expect(first.rows).toHaveLength(4);
+  expect(first.more).toBe(true);
   await alarm(target);
-  expect((await inspect(target)).rows).toHaveLength(4);
+  expect((await inspect(target)).rows).toHaveLength(11);
   await evict(target);
-  await alarm(target);
   await alarm(target);
   for (let i = 0; i < 11; i++) expect(text((await target.read(`key-${i}`)).value)).toBe(String(i));
   expect(
@@ -576,8 +580,11 @@ it("indexes expiration scheduling and cleanup among many records without TTLs", 
   expect(plans.next).toBeNull();
   expect(plans.rowsRead).toBeLessThanOrEqual(1);
   for (const plan of [plans.schedule, plans.cleanup]) {
-    expect(plan.some(row => /expirations/.test(row.detail))).toBe(true);
+    expect(plan.some(row => /USING (COVERING )?INDEX expirations\b/.test(row.detail))).toBe(true);
   }
+  expect(plans.collect.some(row => /USING (COVERING )?INDEX collections\b/.test(row.detail))).toBe(
+    true,
+  );
   const expiresAt = Date.now() + 5000;
   await stub.write(
     "expiring",

@@ -2,7 +2,7 @@ import { Buffer } from "node:buffer";
 import { config, type Env } from "./config";
 import type { Replica } from "./replica";
 import type { RecordValue } from "./model";
-import { EXPIRE_RECORDS, SCHEDULE_EXPIRATION } from "./statements";
+import { COLLECT_GARBAGE, EXPIRE_RECORDS, SCHEDULE_EXPIRATION } from "./statements";
 
 export type ReplicaCommand =
   | { action: "read" | "readVersion"; key: string }
@@ -52,6 +52,9 @@ export async function replicaDebug(
           .toArray(),
         cleanup: state.storage.sql
           .exec<{ detail: string }>(`EXPLAIN QUERY PLAN ${EXPIRE_RECORDS}`, now)
+          .toArray(),
+        collect: state.storage.sql
+          .exec<{ detail: string }>(`EXPLAIN QUERY PLAN ${COLLECT_GARBAGE}`, now)
           .toArray(),
       };
     }

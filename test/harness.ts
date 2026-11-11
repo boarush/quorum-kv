@@ -164,6 +164,7 @@ export const expirationPlans = (stub: DurableObjectStub<Replica>) =>
     rowsRead: number;
     schedule: { detail: string }[];
     cleanup: { detail: string }[];
+    collect: { detail: string }[];
   }>;
 export async function evict(stub: DurableObjectStub<Replica>) {
   // ctx.abort() deliberately rejects the in-flight RPC after storage.sync().

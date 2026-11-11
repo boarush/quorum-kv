@@ -3,7 +3,7 @@ import type { Env } from "./config";
 import { config } from "./config";
 import { replicaDebug, type ReplicaCommand } from "./testing";
 import { compare, EMPTY, type RecordValue, type Version } from "./model";
-import { EXPIRE_RECORDS, SCHEDULE_EXPIRATION } from "./statements";
+import { COLLECT_GARBAGE, EXPIRE_RECORDS, SCHEDULE_EXPIRATION } from "./statements";
 import { SYNC_ALARM_BYTES, SYNC_BATCH_BYTES, syncRowBytes } from "./sync";
 
 type Row = {
@@ -65,6 +65,7 @@ export class Replica extends DurableObject<Env> {
     sql.exec(
       "CREATE INDEX IF NOT EXISTS expirations ON records(expires_at) WHERE value IS NOT NULL",
     );
+    sql.exec("CREATE INDEX IF NOT EXISTS collections ON records(gc_at) WHERE gc_at IS NOT NULL");
     sql.exec(
       "CREATE TABLE IF NOT EXISTS sequence (id INTEGER PRIMARY KEY CHECK(id = 1), seq INTEGER NOT NULL)",
     );
@@ -163,6 +164,7 @@ export class Replica extends DurableObject<Env> {
     const rows: { key: string; record: RecordValue }[] = [];
     let bytes = 0;
     let more = false;
+    let read = 0;
     // Iterate lazily: materializing the row limit first can exhaust DO memory.
     for (const row of this.ctx.storage.sql.exec<Row>(
       "SELECT * FROM records WHERE seq > ? ORDER BY seq LIMIT ?",
@@ -179,8 +181,11 @@ export class Replica extends DurableObject<Env> {
       rows.push({ key: row.key, record: recordValue(row) });
       bytes += size;
       cursor = row.seq;
+      read++;
     }
-    // more signals that the byte budget truncated a non-empty remainder.
+    // A full row limit may also leave a remainder; an extra empty pull is cheaper than a stall.
+    more ||= read === this.options.syncBatch;
+    // more signals that the byte budget or row limit truncated the batch.
     return { rows, cursor, more, bytes };
   }
 
@@ -233,10 +238,7 @@ export class Replica extends DurableObject<Env> {
       await Promise.allSettled(this.peers.map(peer => this.sync(peer)));
       const now = Date.now();
       this.ctx.storage.sql.exec(EXPIRE_RECORDS, now);
-      this.ctx.storage.sql.exec(
-        "DELETE FROM records WHERE gc_at <= ? AND seq <= (SELECT MIN(ack) FROM peers)",
-        now,
-      );
+      this.ctx.storage.sql.exec(COLLECT_GARBAGE, now);
     } finally {
       await this.schedule();
     }

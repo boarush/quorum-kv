@@ -5,3 +5,7 @@ export const SCHEDULE_EXPIRATION =
 
 export const EXPIRE_RECORDS =
   "UPDATE records SET value = NULL WHERE expires_at <= ? AND value IS NOT NULL";
+
+// The partial index on records(gc_at) keeps alarm GC off a full table scan.
+export const COLLECT_GARBAGE =
+  "DELETE FROM records WHERE gc_at <= ? AND seq <= (SELECT MIN(ack) FROM peers)";
