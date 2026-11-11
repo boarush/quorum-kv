@@ -2,6 +2,7 @@ import { Buffer } from "node:buffer";
 import { config, type Env } from "./config";
 import type { Replica } from "./replica";
 import type { RecordValue } from "./model";
+import { EXPIRE_RECORDS, SCHEDULE_EXPIRATION } from "./statements";
 
 export type ReplicaCommand =
   | { action: "read" | "readVersion"; key: string }
@@ -41,19 +42,16 @@ export async function replicaDebug(
       return instance.pull(command.fromPeer, command.cursor);
     case "expirationPlans": {
       const now = Date.now();
-      // These are the scheduling and cleanup statements used by Replica.
-      const schedule =
-        "SELECT MIN(expires_at) AS next FROM records WHERE value IS NOT NULL AND expires_at > ?";
-      const cleanup = "UPDATE records SET value = NULL WHERE expires_at <= ? AND value IS NOT NULL";
-      const query = state.storage.sql.exec<{ next: number | null }>(schedule, now);
+      // Exercise the exact statements used by Replica.
+      const query = state.storage.sql.exec<{ next: number | null }>(SCHEDULE_EXPIRATION, now);
       return {
         next: query.one().next,
         rowsRead: query.rowsRead,
         schedule: state.storage.sql
-          .exec<{ detail: string }>(`EXPLAIN QUERY PLAN ${schedule}`, now)
+          .exec<{ detail: string }>(`EXPLAIN QUERY PLAN ${SCHEDULE_EXPIRATION}`, now)
           .toArray(),
         cleanup: state.storage.sql
-          .exec<{ detail: string }>(`EXPLAIN QUERY PLAN ${cleanup}`, now)
+          .exec<{ detail: string }>(`EXPLAIN QUERY PLAN ${EXPIRE_RECORDS}`, now)
           .toArray(),
       };
     }

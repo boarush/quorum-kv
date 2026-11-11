@@ -53,8 +53,12 @@ function remoteReplica(name: string) {
     pull: (
       fromPeer: string,
       cursor: number,
-    ): Promise<{ rows: { key: string; record: RecordValue }[]; cursor: number }> =>
-      command(name, { action: "pull", fromPeer, cursor }),
+    ): Promise<{
+      rows: { key: string; record: RecordValue }[];
+      cursor: number;
+      more: boolean;
+      bytes: number;
+    }> => command(name, { action: "pull", fromPeer, cursor }),
     write: (key: string, record: RecordValue & { writtenAt: number }): Promise<void> =>
       command(name, { action: "write", key, record }),
     setFault: (fault: { delayMs?: number; fail?: boolean }): Promise<void> =>

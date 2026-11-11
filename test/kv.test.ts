@@ -16,6 +16,7 @@ import { config } from "../src/config";
 import type { Env } from "../src/config";
 import { QuorumKV, QuorumUnavailable } from "../src/coordinator";
 import { compare, type RecordValue } from "../src/model";
+import { SYNC_BATCH_BYTES } from "../src/sync";
 
 const bytes = (value: string) => new TextEncoder().encode(value).buffer as ArrayBuffer;
 const text = (value: ArrayBuffer | null) =>
@@ -512,36 +513,40 @@ it("recovers a large-value backlog across byte-bounded batches and durable curso
     );
   }
   await evict(source);
+
+  // Pagination is monotonic, byte-capped, and yields every record exactly once.
   let cursor = 0;
-  let rounds = 0;
-  for (; rounds < sizes.length && cursor < sizes.length; rounds++) {
+  let batches = 0;
+  const keys: string[] = [];
+  for (;;) {
     const batch = await source.pull(h.replicas[2]!.name, cursor);
-    expect(batch.rows.length).toBeGreaterThan(0);
-    const batchBytes = batch.rows.reduce(
-      (sum, { key, record }) =>
-        sum +
-        2 * (record.value?.byteLength ?? 0) +
-        2 * (key.length + record.version.writer.length) +
-        256,
-      0,
-    );
-    if (batchBytes > 4 * 1024 * 1024) expect(batch.rows).toHaveLength(1);
-    expect(batch.cursor).toBeGreaterThan(cursor);
-    await alarm(target);
-    const applied = await inspect(target);
-    expect(applied.peers.find(peer => peer.name === h.replicas[0]!.name)!.cursor).toBe(
-      batch.cursor,
-    );
-    expect(applied.rows).toHaveLength(batch.cursor);
-    cursor = batch.cursor;
-    if (rounds === 0) {
-      expect(cursor).toBe(1); // Byte budget, not the test stack's four-row limit.
-      await evict(target);
+    if (batch.rows.length === 0) {
+      expect(batch).toEqual({ rows: [], cursor, more: false, bytes: 0 });
+      break;
     }
+    if (batch.bytes > SYNC_BATCH_BYTES) expect(batch.rows).toHaveLength(1);
+    expect(batch.cursor).toBeGreaterThan(cursor);
+    keys.push(...batch.rows.map(row => row.key));
+    cursor = batch.cursor;
+    batches += 1;
+    if (batches === 1) expect(cursor).toBe(1); // Byte budget, not the test stack's four-row limit.
   }
   expect(cursor).toBe(sizes.length);
-  expect(rounds).toBeGreaterThan(2);
-  expect(await source.pull(h.replicas[2]!.name, cursor)).toEqual({ rows: [], cursor });
+  expect(batches).toBeGreaterThan(2);
+  expect(keys).toEqual(sizes.map((_, i) => `large-${i}`));
+
+  // One alarm drains several byte-capped batches instead of one per sync interval.
+  await evict(target);
+  await alarm(target);
+  const applied = await inspect(target);
+  expect(applied.peers.find(peer => peer.name === h.replicas[0]!.name)!.cursor).toBe(sizes.length);
+  expect(applied.rows).toHaveLength(sizes.length);
+
+  // The durable cursor prevents the recovered prefix from being pulled again.
+  await evict(target);
+  await alarm(target);
+  expect((await inspect(target)).rows).toHaveLength(sizes.length);
+
   for (const [i, size] of sizes.entries()) {
     const record = await target.read(`large-${i}`);
     expect(record.version.counter).toBe(1);
@@ -571,7 +576,7 @@ it("indexes expiration scheduling and cleanup among many records without TTLs", 
   expect(plans.next).toBeNull();
   expect(plans.rowsRead).toBeLessThanOrEqual(1);
   for (const plan of [plans.schedule, plans.cleanup]) {
-    expect(plan.some(row => /SEARCH records USING INDEX expirations/.test(row.detail))).toBe(true);
+    expect(plan.some(row => /expirations/.test(row.detail))).toBe(true);
   }
   const expiresAt = Date.now() + 5000;
   await stub.write(

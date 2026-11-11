@@ -3,6 +3,8 @@ import type { Env } from "./config";
 import { config } from "./config";
 import { replicaDebug, type ReplicaCommand } from "./testing";
 import { compare, EMPTY, type RecordValue, type Version } from "./model";
+import { EXPIRE_RECORDS, SCHEDULE_EXPIRATION } from "./statements";
+import { SYNC_ALARM_BYTES, SYNC_BATCH_BYTES, syncRowBytes } from "./sync";
 
 type Row = {
   key: string;
@@ -13,9 +15,6 @@ type Row = {
   gc_at: number | null;
   seq: number;
 };
-
-// Leave ample headroom for concurrent pulls, RPC serialization, and SQLite buffers.
-const SYNC_BATCH_BYTES = 4 * 1024 * 1024;
 
 const recordValue = (row: Row): RecordValue => ({
   value: row.value,
@@ -142,7 +141,12 @@ export class Replica extends DurableObject<Env> {
   async pull(
     fromPeer: string,
     cursor: number,
-  ): Promise<{ rows: { key: string; record: RecordValue }[]; cursor: number }> {
+  ): Promise<{
+    rows: { key: string; record: RecordValue }[];
+    cursor: number;
+    more: boolean;
+    bytes: number;
+  }> {
     await this.before();
     if (
       !this.peers.some(peer => peer.name === fromPeer) ||
@@ -158,59 +162,66 @@ export class Replica extends DurableObject<Env> {
     );
     const rows: { key: string; record: RecordValue }[] = [];
     let bytes = 0;
+    let more = false;
     // Iterate lazily: materializing the row limit first can exhaust DO memory.
     for (const row of this.ctx.storage.sql.exec<Row>(
       "SELECT * FROM records WHERE seq > ? ORDER BY seq LIMIT ?",
       cursor,
       this.options.syncBatch,
     )) {
-      // Budget for a payload copy, UTF-16 strings, and per-record RPC metadata.
-      const size =
-        2 * (row.value?.byteLength ?? 0) + 2 * (row.key.length + row.writer.length) + 256;
+      const size = syncRowBytes(row.key, row.writer, row.value);
       // Always return at least one row, even if a configured value limit permits
       // a row larger than the budget. A single row is bounded by SQLite's row limit.
-      if (rows.length > 0 && bytes + size > SYNC_BATCH_BYTES) break;
+      if (rows.length > 0 && bytes + size > SYNC_BATCH_BYTES) {
+        more = true;
+        break;
+      }
       rows.push({ key: row.key, record: recordValue(row) });
       bytes += size;
       cursor = row.seq;
     }
-    return { rows, cursor };
+    // more signals that the byte budget truncated a non-empty remainder.
+    return { rows, cursor, more, bytes };
   }
 
   private async sync(peer: { name: string; stub: DurableObjectStub<Replica> }) {
-    const cursor = this.ctx.storage.sql
+    let cursor = this.ctx.storage.sql
       .exec<{ cursor: number }>("SELECT cursor FROM peers WHERE name = ?", peer.name)
       .one().cursor;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    try {
-      const batch = await Promise.race([
-        peer.stub.pull(this.name, cursor),
-        new Promise<never>((_, reject) => {
-          timer = setTimeout(() => reject(new Error("Sync timeout")), this.options.timeoutMs);
-        }),
-      ]);
-      this.ctx.storage.transactionSync(() => {
-        // Held versions can be arbitrarily old. Only direct coordinator writes expire.
-        for (const { key, record } of batch.rows) this.apply(key, record);
-        this.ctx.storage.sql.exec(
-          "UPDATE peers SET cursor = ? WHERE name = ?",
-          batch.cursor,
-          peer.name,
-        );
-      });
-    } finally {
-      clearTimeout(timer);
-    }
+    // Drain byte-capped batches within one alarm instead of waiting a sync interval
+    // per batch. The quota bounds the total work so a backlog cannot monopolize it.
+    let drained = 0;
+    let more = false;
+    do {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        const batch = await Promise.race([
+          peer.stub.pull(this.name, cursor),
+          new Promise<never>((_, reject) => {
+            timer = setTimeout(() => reject(new Error("Sync timeout")), this.options.timeoutMs);
+          }),
+        ]);
+        this.ctx.storage.transactionSync(() => {
+          // Held versions can be arbitrarily old. Only direct coordinator writes expire.
+          for (const { key, record } of batch.rows) this.apply(key, record);
+          this.ctx.storage.sql.exec(
+            "UPDATE peers SET cursor = ? WHERE name = ?",
+            batch.cursor,
+            peer.name,
+          );
+        });
+        cursor = batch.cursor;
+        drained += batch.bytes;
+        more = batch.more;
+      } finally {
+        clearTimeout(timer);
+      }
+    } while (more && drained < SYNC_ALARM_BYTES);
   }
 
   private async schedule() {
     const now = Date.now();
-    const row = this.ctx.storage.sql
-      .exec<{ next: number | null }>(
-        "SELECT MIN(expires_at) AS next FROM records WHERE value IS NOT NULL AND expires_at > ?",
-        now,
-      )
-      .one();
+    const row = this.ctx.storage.sql.exec<{ next: number | null }>(SCHEDULE_EXPIRATION, now).one();
     const next = Math.min(now + this.options.syncMs, row.next ?? Infinity);
     const alarm = await this.ctx.storage.getAlarm();
     if (alarm === null || alarm > next) await this.ctx.storage.setAlarm(next);
@@ -221,10 +232,7 @@ export class Replica extends DurableObject<Env> {
       await this.before();
       await Promise.allSettled(this.peers.map(peer => this.sync(peer)));
       const now = Date.now();
-      this.ctx.storage.sql.exec(
-        "UPDATE records SET value = NULL WHERE expires_at <= ? AND value IS NOT NULL",
-        now,
-      );
+      this.ctx.storage.sql.exec(EXPIRE_RECORDS, now);
       this.ctx.storage.sql.exec(
         "DELETE FROM records WHERE gc_at <= ? AND seq <= (SELECT MIN(ack) FROM peers)",
         now,
