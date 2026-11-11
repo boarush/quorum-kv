@@ -16,7 +16,7 @@ import { config } from "../src/config";
 import type { Env } from "../src/config";
 import { QuorumKV, QuorumUnavailable } from "../src/coordinator";
 import { compare, type RecordValue } from "../src/model";
-import { SYNC_BATCH_BYTES } from "../src/sync";
+import { SYNC_ALARM_PULLS, SYNC_BATCH_BYTES } from "../src/sync";
 
 const bytes = (value: string) => new TextEncoder().encode(value).buffer as ArrayBuffer;
 const text = (value: ArrayBuffer | null) =>
@@ -497,6 +497,84 @@ it("converges without reads using bounded batches and durable peer cursors", asy
   expect(
     (await inspect(target)).peers.find(peer => peer.name === h.replicas[0]!.name)!.cursor,
   ).toBe(11);
+});
+
+it("caps small-record pulls per alarm and resumes from the durable cursor", async () => {
+  const h = await setup();
+  const source = h.replicas[0]!.stub;
+  const target = h.replicas[2]!.stub;
+  const batchRows = 4; // The test stack's SYNC_BATCH.
+  const count = batchRows * (SYNC_ALARM_PULLS + 3);
+  for (let i = 0; i < count; i++) {
+    await source.write(
+      `small-${i}`,
+      stamped({
+        value: new ArrayBuffer(0),
+        version: { counter: 1, writer: "quota" },
+        expiresAt: null,
+      }),
+    );
+  }
+  await alarm(target);
+  const first = await inspect(target);
+  const cursor = first.peers.find(peer => peer.name === h.replicas[0]!.name)!.cursor;
+  expect(cursor).toBe(batchRows * SYNC_ALARM_PULLS);
+  expect(first.rows).toHaveLength(cursor);
+  expect(first.alarm).not.toBeNull();
+  await evict(target);
+  await alarm(target);
+  const recovered = await inspect(target);
+  expect(recovered.peers.find(peer => peer.name === h.replicas[0]!.name)!.cursor).toBe(count);
+  expect(recovered.rows).toHaveLength(count);
+});
+
+it("shares one sync deadline across slow pulls without delaying cleanup for the backlog", async () => {
+  const h = await setup();
+  const source = h.replicas[0]!.stub;
+  const target = h.replicas[2]!.stub;
+  const count = 16;
+  for (let i = 0; i < count; i++) {
+    await source.write(
+      `slow-${i}`,
+      stamped({
+        value: new ArrayBuffer(0),
+        version: { counter: 1, writer: "deadline" },
+        expiresAt: null,
+      }),
+    );
+  }
+  await target.write(
+    "expired-during-sync",
+    stamped({
+      value: bytes("expired"),
+      version: { counter: 1, writer: "deadline" },
+      expiresAt: Date.now() - 1,
+    }),
+  );
+  const { timeoutMs } = config(h.bindings);
+  const delayMs = timeoutMs * 0.6;
+  await source.setFault({ delayMs });
+  const start = Date.now();
+  await alarm(target);
+  expect(Date.now() - start).toBeLessThan(timeoutMs + 1000);
+  const first = await inspect(target);
+  const cursor = first.peers.find(peer => peer.name === h.replicas[0]!.name)!.cursor;
+  expect(cursor).toBe(4); // The second pull exceeds the shared deadline, not its own timeout.
+  expect(first.rows).toHaveLength(cursor + 1);
+  expect(first.alarm).not.toBeNull();
+  expect((await target.read("expired-during-sync")).value).toBeNull();
+
+  await source.setFault({});
+  // A timed-out RPC cannot be cancelled. Its late response must not advance the cursor.
+  await pause(delayMs);
+  expect(
+    (await inspect(target)).peers.find(peer => peer.name === h.replicas[0]!.name)!.cursor,
+  ).toBe(cursor);
+  await evict(target);
+  await alarm(target);
+  const recovered = await inspect(target);
+  expect(recovered.peers.find(peer => peer.name === h.replicas[0]!.name)!.cursor).toBe(count);
+  expect(recovered.rows).toHaveLength(count + 1);
 });
 
 it("recovers a large-value backlog across byte-bounded batches and durable cursors", async () => {

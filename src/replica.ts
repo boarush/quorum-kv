@@ -4,7 +4,7 @@ import { config } from "./config";
 import { replicaDebug, type ReplicaCommand } from "./testing";
 import { compare, EMPTY, type RecordValue, type Version } from "./model";
 import { COLLECT_GARBAGE, EXPIRE_RECORDS, SCHEDULE_EXPIRATION } from "./statements";
-import { SYNC_ALARM_BYTES, SYNC_BATCH_BYTES, syncRowBytes } from "./sync";
+import { SYNC_ALARM_BYTES, SYNC_ALARM_PULLS, SYNC_BATCH_BYTES, syncRowBytes } from "./sync";
 
 type Row = {
   key: string;
@@ -193,17 +193,19 @@ export class Replica extends DurableObject<Env> {
     let cursor = this.ctx.storage.sql
       .exec<{ cursor: number }>("SELECT cursor FROM peers WHERE name = ?", peer.name)
       .one().cursor;
-    // Drain byte-capped batches within one alarm instead of waiting a sync interval
-    // per batch. The quota bounds the total work so a backlog cannot monopolize it.
+    // Bound both fast tiny-row backlogs and slow responsive peers. Every pull
+    // shares one timeout budget; completed batches keep their durable progress.
+    const deadline = performance.now() + this.options.timeoutMs;
     let drained = 0;
-    let more = false;
-    do {
+    for (let pulls = 0; pulls < SYNC_ALARM_PULLS; pulls++) {
+      const remaining = deadline - performance.now();
+      if (remaining <= 0) break;
       let timer: ReturnType<typeof setTimeout> | undefined;
       try {
         const batch = await Promise.race([
           peer.stub.pull(this.name, cursor),
           new Promise<never>((_, reject) => {
-            timer = setTimeout(() => reject(new Error("Sync timeout")), this.options.timeoutMs);
+            timer = setTimeout(() => reject(new Error("Sync timeout")), remaining);
           }),
         ]);
         this.ctx.storage.transactionSync(() => {
@@ -217,11 +219,11 @@ export class Replica extends DurableObject<Env> {
         });
         cursor = batch.cursor;
         drained += batch.bytes;
-        more = batch.more;
+        if (!batch.more || drained >= SYNC_ALARM_BYTES) break;
       } finally {
         clearTimeout(timer);
       }
-    } while (more && drained < SYNC_ALARM_BYTES);
+    }
   }
 
   private async schedule() {
