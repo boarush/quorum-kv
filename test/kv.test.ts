@@ -1,21 +1,21 @@
+import { it, expect, vi } from "vitest";
+import { runInDurableObject } from "cloudflare:test";
 import {
   setup,
-  it,
-  expect,
   drain,
-  deployedRequest,
+  workerRequest,
   request,
   alarm,
   age,
   inspect,
   expirationPlans,
   evict,
-  productionUrl,
-} from "./harness";
+  setFault,
+} from "./fixtures";
 import { config } from "../src/config";
-import type { Env } from "../src/config";
 import { QuorumKV, QuorumUnavailable } from "../src/coordinator";
 import { compare, type RecordValue } from "../src/model";
+import { Replica } from "../src/replica";
 import { SYNC_ALARM_PULLS, SYNC_BATCH_BYTES } from "../src/sync";
 
 const bytes = (value: string) => new TextEncoder().encode(value).buffer as ArrayBuffer;
@@ -23,28 +23,6 @@ const text = (value: ArrayBuffer | null) =>
   value === null ? null : new TextDecoder().decode(value);
 const stamped = (record: RecordValue) => ({ ...record, writtenAt: Date.now() });
 const pause = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
-
-function repairFailingEnv(bindings: Env, failing: Set<string>): Env {
-  const namespace = bindings.REPLICAS;
-  return {
-    ...bindings,
-    REPLICAS: {
-      idFromName: (name: string) => namespace.idFromName(name),
-      get: (...args: Parameters<Env["REPLICAS"]["get"]>) => {
-        const [id, options] = args;
-        const stub = namespace.get(id, options);
-        if (!id.name || !failing.has(id.name)) return stub;
-        return {
-          read: (key: string) => stub.read(key),
-          readVersion: (key: string) => stub.readVersion(key),
-          write: async () => {
-            throw new Error("Injected repair failure");
-          },
-        } as unknown as ReturnType<Env["REPLICAS"]["get"]>;
-      },
-    } as unknown as Env["REPLICAS"],
-  } as Env;
-}
 
 it("roundtrips raw bytes and empty values through the Worker and real SQLite DOs", async () => {
   const h = await setup();
@@ -60,11 +38,11 @@ it("roundtrips raw bytes and empty values through the Worker and real SQLite DOs
   expect((await h.request()).headers.get("Content-Type")).toBe("application/octet-stream");
 });
 
-it("routes an end-to-end request through the deployed module export", async () => {
+it("dispatches requests through the Worker export and its real replica binding", async () => {
   const { key } = await setup();
-  const put = await deployedRequest(`/kv/${key}`, { method: "PUT", body: "edge" });
+  const put = await workerRequest(`/kv/${key}`, { method: "PUT", body: "edge" });
   expect(put.status).toBe(204);
-  const get = await deployedRequest(`/kv/${key}`);
+  const get = await workerRequest(`/kv/${key}`);
   expect(text(await get.arrayBuffer())).toBe("edge");
 });
 
@@ -134,18 +112,18 @@ it("expires a value from its replicated deadline without a coordinator write", a
 it("serves reads, writes, and deletes when any one replica is down", async () => {
   for (let down = 0; down < 3; down++) {
     const h = await setup();
-    await h.replicas[down]!.stub.setFault({ fail: true });
+    await setFault(h.replicas[down]!.stub, { fail: true });
     expect((await h.request("PUT", "available")).status).toBe(204);
     expect(text(await (await h.request()).arrayBuffer())).toBe("available");
     expect((await h.request("DELETE")).status).toBe(204);
     expect((await h.request()).status).toBe(404);
-    await h.replicas[down]!.stub.setFault({});
+    await setFault(h.replicas[down]!.stub, {});
   }
 });
 
 it("takes the fastest two replicas without waiting for a slow replica or its timeout", async () => {
   const h = await setup({ REPLICA_TIMEOUT_MS: "250" });
-  await h.replicas[2]!.stub.setFault({ delayMs: 600 });
+  await setFault(h.replicas[2]!.stub, { delayMs: 600 });
   const start = Date.now();
   expect((await h.request("PUT", "fast")).status).toBe(204);
   expect(text(await (await h.request()).arrayBuffer())).toBe("fast");
@@ -155,7 +133,7 @@ it("takes the fastest two replicas without waiting for a slow replica or its tim
 
 it("takes the fastest two replicas without waiting for a slow replica within its timeout", async () => {
   const h = await setup({ REPLICA_TIMEOUT_MS: "1000" });
-  await h.replicas[2]!.stub.setFault({ delayMs: 500 });
+  await setFault(h.replicas[2]!.stub, { delayMs: 500 });
   const start = Date.now();
   expect((await h.request("PUT", "fast")).status).toBe(204);
   expect(text(await (await h.request()).arrayBuffer())).toBe("fast");
@@ -165,7 +143,7 @@ it("takes the fastest two replicas without waiting for a slow replica within its
 
 it("returns 503 without quorum instead of serving a lone replica", async () => {
   const h = await setup();
-  await Promise.all(h.replicas.slice(0, 2).map(({ stub }) => stub.setFault({ fail: true })));
+  await Promise.all(h.replicas.slice(0, 2).map(({ stub }) => setFault(stub, { fail: true })));
   for (const method of ["GET", "PUT", "DELETE"]) {
     expect((await h.request(method, method === "PUT" ? "no-quorum" : undefined)).status).toBe(503);
   }
@@ -185,20 +163,17 @@ it("rejects a read when the repair quorum is unavailable", async () => {
   };
   await h.replicas[0]!.stub.write(h.key, stamped(stale));
   await Promise.all(h.replicas.slice(1).map(({ stub }) => stub.write(h.key, stamped(fresh))));
-  await h.replicas[2]!.stub.setFault({ delayMs: 100 });
-  const kv = new QuorumKV(
-    repairFailingEnv(h.bindings, new Set([h.replicas[0]!.name, h.replicas[1]!.name])),
-    h.ctx,
-  );
-  await expect(kv.get(h.key)).rejects.toBeInstanceOf(QuorumUnavailable);
-  expect(kv.phases.map(phase => phase.name)).toEqual(["read", "repair"]);
+  await setFault(h.replicas[2]!.stub, { delayMs: 100 });
+  vi.spyOn(Replica.prototype, "write").mockRejectedValue(new Error("Injected repair failure"));
+  await expect(h.kv.get(h.key)).rejects.toBeInstanceOf(QuorumUnavailable);
+  expect(h.kv.phases.map(phase => phase.name)).toEqual(["read", "repair"]);
   await drain(h.ctx);
-  await h.replicas[2]!.stub.setFault({});
+  await setFault(h.replicas[2]!.stub, {});
 });
 
 it("bounds unresponsive quorum attempts with per-replica timeouts", async () => {
   const h = await setup({ REPLICA_TIMEOUT_MS: "60" });
-  await Promise.all(h.replicas.slice(0, 2).map(({ stub }) => stub.setFault({ delayMs: 300 })));
+  await Promise.all(h.replicas.slice(0, 2).map(({ stub }) => setFault(stub, { delayMs: 300 })));
   const start = Date.now();
   expect((await h.request()).status).toBe(503);
   expect(Date.now() - start).toBeLessThan(250);
@@ -207,12 +182,12 @@ it("bounds unresponsive quorum attempts with per-replica timeouts", async () => 
 
 it("repairs a stale third replica when it participates in a read quorum", async () => {
   const h = await setup();
-  await h.replicas[2]!.stub.setFault({ fail: true });
+  await setFault(h.replicas[2]!.stub, { fail: true });
   await h.kv.put(h.key, bytes("repaired"));
   await drain(h.ctx);
-  await h.replicas[2]!.stub.setFault({});
+  await setFault(h.replicas[2]!.stub, {});
   expect((await h.replicas[2]!.stub.readVersion(h.key)).counter).toBe(0);
-  await h.replicas[1]!.stub.setFault({ delayMs: 100 });
+  await setFault(h.replicas[1]!.stub, { delayMs: 100 });
   expect(text(await h.kv.get(h.key))).toBe("repaired");
   expect(h.kv.phases.at(-1)!.name).toBe("repair");
   await drain(h.ctx);
@@ -230,15 +205,15 @@ it("lets a later completed write outrank an earlier partial write", async () => 
     expiresAt: null,
     writtenAt: Date.now(),
   });
-  await h.replicas[2]!.stub.setFault({ fail: true });
+  await setFault(h.replicas[2]!.stub, { fail: true });
   await h.kv.put(h.key, bytes("completed"));
   await drain(h.ctx);
-  await h.replicas[2]!.stub.setFault({});
+  await setFault(h.replicas[2]!.stub, {});
   // Delay one replica so the read quorum includes the completed and partial copies.
-  await h.replicas[1]!.stub.setFault({ delayMs: 100 });
+  await setFault(h.replicas[1]!.stub, { delayMs: 100 });
   expect(text(await h.kv.get(h.key))).toBe("completed");
   await drain(h.ctx);
-  await h.replicas[1]!.stub.setFault({});
+  await setFault(h.replicas[1]!.stub, {});
   const records = await Promise.all(h.replicas.map(({ stub }) => stub.read(h.key)));
   expect(records.map(record => text(record.value))).toEqual([
     "completed",
@@ -262,7 +237,7 @@ it("repairs tombstones and expired records rather than resurrecting stale values
     };
     await Promise.all(h.replicas.map(({ stub }) => stub.write(h.key, stamped(old))));
     await Promise.all(h.replicas.slice(0, 2).map(({ stub }) => stub.write(h.key, stamped(latest))));
-    await h.replicas[1]!.stub.setFault({ fail: true });
+    await setFault(h.replicas[1]!.stub, { fail: true });
     expect(await h.kv.get(h.key)).toBeNull();
     expect((await h.replicas[2]!.stub.readVersion(h.key)).counter).toBe(2);
   }
@@ -384,7 +359,7 @@ it("sets no-store on error responses", async () => {
   const oversized = await h.request("PUT", new Uint8Array(1024 * 1024 + 1));
   expect(oversized.status).toBe(413);
   expect(oversized.headers.get("Cache-Control")).toBe("no-store");
-  await Promise.all(h.replicas.slice(0, 2).map(({ stub }) => stub.setFault({ fail: true })));
+  await Promise.all(h.replicas.slice(0, 2).map(({ stub }) => setFault(stub, { fail: true })));
   const unavailable = await h.request();
   expect(unavailable.status).toBe(503);
   expect(unavailable.headers.get("Cache-Control")).toBe("no-store");
@@ -414,15 +389,19 @@ it("bounds timer configuration and isolates the default hints", async () => {
   expect(config(h.bindings).hints).toEqual(["apac", "me", "weur"]);
 });
 
-it("gates debug routes on TESTING and validates fault injection", async () => {
+it("has no debug HTTP routes or fault-injection RPC methods", async () => {
   const h = await setup();
-  expect((await request("/debug/fault")).status).toBe(404);
-  for (const path of ["/_debug/request", `/_debug/replica/${h.replicas[0]!.name}`]) {
-    expect((await fetch(`${productionUrl}${path}`, { method: "POST", body: "{}" })).status).toBe(
-      404,
-    );
+  for (const path of [
+    "/debug/fault",
+    "/_debug/request",
+    `/_debug/replica/${h.replicas[0]!.name}`,
+  ]) {
+    expect((await workerRequest(path, { method: "POST", body: "{}" })).status).toBe(404);
   }
-  await expect(h.replicas[0]!.stub.setFault({ delayMs: -1 })).rejects.toThrow();
+  await runInDurableObject(h.replicas[0]!.stub, instance => {
+    expect(instance).not.toHaveProperty("setFault");
+    expect(instance).not.toHaveProperty("debug");
+  });
 });
 
 async function ageGc(replicas: Awaited<ReturnType<QuorumKV["replicas"]>>) {
@@ -444,7 +423,7 @@ it("keeps deleted and expired versions beyond grace while a replica is offline",
     await drain(h.ctx);
     const oldVersion = await h.replicas[0]!.stub.readVersion(h.key);
     const missing = h.replicas[2]!.stub;
-    await missing.setFault({ fail: true });
+    await setFault(missing, { fail: true });
     if (expired) {
       await h.kv.put(h.key, bytes("expires"), { ttlSeconds: 0.001 });
       await pause(10);
@@ -458,7 +437,7 @@ it("keeps deleted and expired versions beyond grace while a replica is offline",
       expect(compare(await stub.readVersion(h.key), oldVersion)).toBeGreaterThan(0);
       expect((await stub.read(h.key)).value).toBeNull();
     }
-    await missing.setFault({});
+    await setFault(missing, {});
     expect(text((await missing.read(h.key)).value)).toBe("old");
     await syncRounds(h.replicas);
     expect((await missing.read(h.key)).value).toBeNull();
@@ -503,7 +482,7 @@ it("caps small-record pulls per alarm and resumes from the durable cursor", asyn
   const h = await setup();
   const source = h.replicas[0]!.stub;
   const target = h.replicas[2]!.stub;
-  const batchRows = 4; // The test stack's SYNC_BATCH.
+  const batchRows = 4; // The Workers project's SYNC_BATCH.
   const count = batchRows * (SYNC_ALARM_PULLS + 3);
   for (let i = 0; i < count; i++) {
     await source.write(
@@ -553,7 +532,7 @@ it("shares one sync deadline across slow pulls without delaying cleanup for the 
   );
   const { timeoutMs } = config(h.bindings);
   const delayMs = timeoutMs * 0.6;
-  await source.setFault({ delayMs });
+  await setFault(source, { delayMs });
   const start = Date.now();
   await alarm(target);
   expect(Date.now() - start).toBeLessThan(timeoutMs + 1000);
@@ -564,7 +543,7 @@ it("shares one sync deadline across slow pulls without delaying cleanup for the 
   expect(first.alarm).not.toBeNull();
   expect((await target.read("expired-during-sync")).value).toBeNull();
 
-  await source.setFault({});
+  await setFault(source, {});
   // A timed-out RPC cannot be cancelled. Its late response must not advance the cursor.
   await pause(delayMs);
   expect(
@@ -611,13 +590,14 @@ it("recovers a large-value backlog across byte-bounded batches and durable curso
     keys.push(...batch.rows.map(row => row.key));
     cursor = batch.cursor;
     batches += 1;
-    if (batches === 1) expect(cursor).toBe(1); // Byte budget, not the test stack's four-row limit.
+    if (batches === 1) expect(cursor).toBe(1); // Byte budget, not the test project's four-row limit.
   }
   expect(cursor).toBe(sizes.length);
   expect(batches).toBeGreaterThan(2);
   expect(keys).toEqual(sizes.map((_, i) => `large-${i}`));
 
   // One alarm drains several byte-capped batches instead of one per sync interval.
+  expect((await target.readVersion("large-0")).counter).toBe(0);
   await evict(target);
   await alarm(target);
   const applied = await inspect(target);
@@ -729,7 +709,9 @@ it("rejects an old direct write after acknowledged GC", async () => {
   await syncRounds(h.replicas);
   for (const { stub } of h.replicas) {
     expect((await stub.readVersion(h.key)).counter).toBe(0);
-    await expect(stub.write(h.key, stale)).rejects.toThrow("Write exceeds GC grace");
+    await runInDurableObject(stub, async instance => {
+      await expect(instance.write(h.key, stale)).rejects.toThrow("Write exceeds GC grace");
+    });
     expect((await stub.read(h.key)).value).toBeNull();
   }
   expect(await h.kv.get(h.key)).toBeNull();
@@ -745,10 +727,10 @@ it("retries peer sync failures on later alarms without losing cursors", async ()
       expiresAt: null,
     }),
   );
-  await h.replicas[0]!.stub.setFault({ fail: true });
+  await setFault(h.replicas[0]!.stub, { fail: true });
   await alarm(h.replicas[2]!.stub);
   expect((await h.replicas[2]!.stub.readVersion(h.key)).counter).toBe(0);
-  await h.replicas[0]!.stub.setFault({});
+  await setFault(h.replicas[0]!.stub, {});
   await alarm(h.replicas[2]!.stub);
   expect(text((await h.replicas[2]!.stub.read(h.key)).value)).toBe("retry");
 });

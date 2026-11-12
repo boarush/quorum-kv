@@ -234,39 +234,45 @@ boundary around an expiration.
 
 ```sh
 npm ci
-npm run check        # TypeScript, Oxlint, Oxfmt check, and the Vitest suite
+npm run check        # TypeScript, Oxlint, Oxfmt check, and both Vitest projects
 npm run format       # apply Oxfmt
 ```
 
-`npm run check` runs the real thing: `@alchemy.run/test/Vitest` deploys the Alchemy stack once
-per suite in local mode, drives actual workerd SQLite Durable Objects over HTTP, and tears the
-stack down afterward. A second stack without test bindings verifies that the debug routes
-return 404. Fixtures use distinct shards, and coordinator tests use HTTP-backed replica
-adapters.
+`npm test` runs both Vitest projects locally by default, without Cloudflare credentials or
+cloud state-store bootstrap.
 
-### The test-only debug bridge
+### Testing Durable Objects
 
-The test stack sets `TESTING=true` and `SYNC_BATCH=4`. Only that binding enables
-`POST /_debug/replica/:name`, a fixed-command bridge for replica reads, writes, faults, alarm
-delivery, row and cursor inspection, pulls, expiration query plans, deadline aging, and eviction
-after a durable storage sync. There is also `POST /_debug/request`, which runs the HTTP handler
-with per-request timeout and value-limit overrides and can reconstruct streamed bodies —
-including deliberately false `Content-Length` values that HTTP clients won't send on the wire.
+`npm run test:workers` runs the detailed KV suite using Cloudflare's official
+[Workers Vitest integration](https://developers.cloudflare.com/workers/testing/vitest-integration/)
+(`@cloudflare/vitest-plugin`). Tests and the real SQLite Durable Objects run inside workerd.
+Tests access bindings through `cloudflare:workers` and use `cloudflare:test` for instance and
+storage inspection, alarm delivery, and eviction.
 
-Production configuration omits `TESTING` entirely, and both the HTTP bridge and its Durable
-Object RPC reject anything other than the exact string `"true"`.
+Fault injection uses Vitest prototype spies scoped to selected instances, entirely in
+`test/fixtures.ts`. After each test, background contexts drain, spies are restored, and binding
+storage is reset. Only this project's Vitest configuration sets `SYNC_BATCH=4` for pagination
+coverage; the runtime has no test flag, debug HTTP bridge, or fault-injection RPCs.
+
+### Public-HTTP smoke tests
+
+`npm run test:http` exercises the uninstrumented Worker using Alchemy's
+[Test harness](https://alchemy.run/testing/test-harness): `Test.make` from
+`@alchemy.run/test/Vitest`, one `beforeAll(deploy(Stack))`, and one `afterAll(destroy(Stack))`.
+The `quorum-kv-test` stack in `test/stack.ts` uses the production Worker factory without extra
+bindings and keeps Alchemy state locally under `.alchemy/`. Requests use the deployed URL
+from the setup output handle, never a hard-coded localhost URL. Only the startup probe is
+retried; test requests are not.
 
 ### Running tests against the real thing
 
-`ALCHEMY_TEST_DEV=0 npm test` runs the same suite live against a configured Cloudflare
-profile; `ALCHEMY_TEST_DEV=1` forces local mode. The harness defaults to `dev: true` and reads
-URLs from stack outputs instead of assuming localhost. Live runs deploy a throwaway
-`TESTING`-enabled stage plus a guard stage, then destroy both. Stage names are random unless
-`ALCHEMY_TEST_STAGE` is set, and any stage you pass explicitly must still be disposable.
+`ALCHEMY_TEST_DEV=0 npm run test:http` runs the HTTP smoke tests live with a configured
+Cloudflare profile; `ALCHEMY_TEST_DEV=1` forces local mode. The detailed fault and storage suite
+always runs locally in the Workers runtime, not against a remote deployment. Stage names are
+random unless `ALCHEMY_TEST_STAGE` is set, and any explicit stage must also be disposable.
 
-Never point a test run at an existing deployment, and never expose a `TESTING`-enabled stage to
-untrusted callers. Tight latency assertions also want a test runner physically near the
-deployed Worker.
+Never point a test run at an existing deployment: the harness destroys its test stack after
+the suite.
 
 ## Running and deploying
 
@@ -274,7 +280,8 @@ deployed Worker.
 with `PORT`. Alchemy keeps deployment state in the Cloudflare state store, so both local
 development and `npm run deploy` need a configured Cloudflare profile. On first use,
 `Cloudflare.state()` deploys or adopts the account-level `alchemy-state-store` Worker.
-Deployment is not part of the local test suite.
+This production/dev state backend is separate from the test stack's local state; local tests
+never deploy cloud resources.
 
 ## Please don't ship this as-is
 

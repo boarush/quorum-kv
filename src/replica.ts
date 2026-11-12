@@ -1,7 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "./config";
 import { config } from "./config";
-import { replicaDebug, type ReplicaCommand } from "./testing";
 import { compare, EMPTY, type RecordValue, type Version } from "./model";
 import { COLLECT_GARBAGE, EXPIRE_RECORDS, SCHEDULE_EXPIRATION } from "./statements";
 import { SYNC_ALARM_BYTES, SYNC_ALARM_PULLS, SYNC_BATCH_BYTES, syncRowBytes } from "./sync";
@@ -23,7 +22,6 @@ const recordValue = (row: Row): RecordValue => ({
 });
 
 export class Replica extends DurableObject<Env> {
-  private fault = { delayMs: 0, fail: false };
   private readonly options;
   private readonly name: string;
   private readonly peers: { name: string; stub: DurableObjectStub<Replica> }[];
@@ -78,12 +76,6 @@ export class Replica extends DurableObject<Env> {
     ctx.blockConcurrencyWhile(() => this.schedule());
   }
 
-  private async before() {
-    const { delayMs, fail } = this.fault;
-    if (delayMs) await new Promise(resolve => setTimeout(resolve, delayMs));
-    if (fail) throw new Error("Injected replica failure");
-  }
-
   private stored(key: string): RecordValue {
     const row = this.ctx.storage.sql
       .exec<Row>("SELECT * FROM records WHERE key = ?", key)
@@ -92,12 +84,10 @@ export class Replica extends DurableObject<Env> {
   }
 
   async readVersion(key: string): Promise<Version> {
-    await this.before();
     return this.stored(key).version;
   }
 
   async read(key: string): Promise<RecordValue> {
-    await this.before();
     return this.stored(key);
   }
 
@@ -127,7 +117,6 @@ export class Replica extends DurableObject<Env> {
   }
 
   async write(key: string, record: RecordValue & { writtenAt: number }): Promise<void> {
-    await this.before();
     if (
       !Number.isFinite(record.writtenAt) ||
       record.writtenAt < Date.now() - this.options.gcGraceMs
@@ -148,7 +137,6 @@ export class Replica extends DurableObject<Env> {
     more: boolean;
     bytes: number;
   }> {
-    await this.before();
     if (
       !this.peers.some(peer => peer.name === fromPeer) ||
       !Number.isSafeInteger(cursor) ||
@@ -236,7 +224,6 @@ export class Replica extends DurableObject<Env> {
 
   async alarm(): Promise<void> {
     try {
-      await this.before();
       await Promise.allSettled(this.peers.map(peer => this.sync(peer)));
       const now = Date.now();
       this.ctx.storage.sql.exec(EXPIRE_RECORDS, now);
@@ -244,18 +231,5 @@ export class Replica extends DurableObject<Env> {
     } finally {
       await this.schedule();
     }
-  }
-
-  async debug(command: ReplicaCommand) {
-    if (this.env.TESTING !== "true") throw new Error("Debug RPC is disabled");
-    return replicaDebug(this, this.ctx, command);
-  }
-
-  async setFault(fault: { delayMs?: number; fail?: boolean }): Promise<void> {
-    if (this.env.TESTING !== "true") throw new Error("Fault injection is disabled");
-    const delayMs = fault.delayMs ?? 0;
-    if (!Number.isFinite(delayMs) || delayMs < 0 || delayMs > 60_000)
-      throw new Error("Invalid delay");
-    this.fault = { delayMs, fail: fault.fail ?? false };
   }
 }

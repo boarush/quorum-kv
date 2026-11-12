@@ -4,6 +4,8 @@
   "type": "module",
   "scripts": {
     "test": "vitest run",
+    "test:workers": "vitest run --project workers",
+    "test:http": "vitest run --project http",
     "typecheck": "tsc --noEmit",
     "lint": "oxlint --deny-warnings",
     "format": "oxfmt",
@@ -15,6 +17,7 @@
   "devDependencies": {
     "@alchemy.run/cloudflare": "2.0.0-beta.85",
     "@alchemy.run/test": "2.0.0-beta.85",
+    "@cloudflare/vitest-plugin": "1.7.0",
     "@cloudflare/workers-types": "latest",
     "@effect/platform-node": "^4.1.2",
     "@effect/vitest": "4.1.2",
@@ -27,10 +30,14 @@
     "vitest": "5.0.4",
     "ws": "8.22.2"
   },
+  "overrides": {
+    "workerd": "1.20261112.1"
+  },
   "engines": {
     "node": ">=24.11.1"
   },
   "allowScripts": {
-    "workerd@1.20261026.1": true
+    "esbuild@0.28.2": true,
+    "workerd@1.20261112.1": true
   }
 }

@@ -1,6 +1,5 @@
 import type { Env } from "./config";
 import { config } from "./config";
-import { debugFetch } from "./testing";
 import { QuorumKV, QuorumUnavailable } from "./coordinator";
 export { Replica } from "./replica";
 
@@ -17,7 +16,6 @@ export default {
     ctx: ExecutionContext,
   ): Promise<Response> {
     const url = new URL(request.url);
-    if (url.pathname.startsWith("/_debug/")) return debugFetch(request, env, ctx, fetch);
     if (!url.pathname.startsWith("/kv/")) return noStore("Not found", { status: 404 });
     let key: string;
     try {

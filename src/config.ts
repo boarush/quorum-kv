@@ -9,7 +9,6 @@ export interface Env {
   SYNC_MS?: string;
   SYNC_BATCH?: string;
   MAX_VALUE_BYTES?: string;
-  TESTING?: string;
 }
 
 export const DEFAULTS = {
