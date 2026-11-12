@@ -4,8 +4,11 @@ import { compare, type RecordValue } from "./model";
 import type { Replica } from "./replica";
 
 export class QuorumUnavailable extends Error {
+  readonly code = "QUORUM_UNAVAILABLE";
+
   constructor() {
     super("Replica quorum unavailable");
+    this.name = "QuorumUnavailable";
   }
 }
 
@@ -24,6 +27,12 @@ export async function shardFor(key: string, shards: number): Promise<number> {
   return new DataView(digest).getUint32(0) % shards;
 }
 
+function validateKey(key: string): void {
+  if (!key || new TextEncoder().encode(key).byteLength > 1024) {
+    throw new RangeError("Key must contain 1–1024 UTF-8 bytes");
+  }
+}
+
 export class QuorumKV {
   private readonly options;
   readonly phases: Phase[] = [];
@@ -36,6 +45,7 @@ export class QuorumKV {
   }
 
   async replicas(key: string) {
+    validateKey(key);
     const shard = await shardFor(key, this.options.shards);
     return this.options.hints.map((locationHint, i) => {
       const name = `shard-${shard}-r${i}`;

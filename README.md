@@ -20,7 +20,7 @@ runtime preserves `ctx.id.name` for named RPCs and alarms.
 
 ```mermaid
 flowchart LR
-    C[Client] -->|GET / PUT / DELETE| W["Worker<br/>coordinator"]
+    C[Caller Worker] -->|"api.get / put / delete"| W["Api<br/>WorkerEntrypoint"]
     W -->|"SHA-256(key) mod 1024"| S["shard n"]
     S --> R0["shard-n-r0<br/>apac"]
     S --> R1["shard-n-r1<br/>me"]
@@ -46,13 +46,13 @@ waits for two acknowledgments.
 ```mermaid
 sequenceDiagram
     autonumber
-    participant C as Client
+    participant C as Caller
     participant W as Coordinator
     participant R0 as r0
     participant R1 as r1
     participant R2 as r2
 
-    C->>W: PUT /kv/my-key
+    C->>W: api.put("my-key", value)
     W->>R0: readVersion
     W->>R1: readVersion
     W->>R2: readVersion
@@ -66,7 +66,7 @@ sequenceDiagram
     Note over W: keep the first 2 acks
     R0-->>W: ok
     R2-->>W: ok
-    W-->>C: 204
+    W-->>C: resolves
     Note over R1: the third request keeps<br/>running in the background
 ```
 
@@ -74,9 +74,9 @@ The version counter is wall-clock milliseconds, but always at least one above th
 counter observed. A random writer ID breaks ties within the same millisecond. Deletes use the
 same path with a null tombstone as the value.
 
-If two of the three replicas don't answer within the phase timeout, the request fails with
-HTTP 503. Requests that were already dispatched are not cancelled — they finish in the
-background, which is why a timed-out write can still commit.
+If two of the three replicas don't answer within the phase timeout, the request throws
+`QuorumUnavailable`. Requests that were already dispatched are not cancelled — they finish in
+the background, which is why a timed-out write can still commit.
 
 ### Reading a value
 
@@ -85,16 +85,16 @@ repairs the lagging replicas first, then answers.
 
 ```mermaid
 flowchart TD
-    A["GET /kv/my-key"] --> B["Ask all 3 replicas,<br/>keep the first 2 full records"]
+    A["api.get(\"my-key\")"] --> B["Ask all 3 replicas,<br/>keep the first 2 full records"]
     B --> C{"Versions match?"}
     C -->|yes| D{"Expired?"}
     C -->|no| E["Write the newest record back<br/>to all 3 replicas"]
     E --> D
-    D -->|"yes"| G["404"]
+    D -->|"yes"| G["null"]
     D -->|"no"| V{"Value is null?<br/>(tombstone)"}
     V -->|"yes"| G
-    V -->|"no"| F["200 + raw bytes"]
-    B -.->|"fewer than 2 replies"| H["503"]
+    V -->|"no"| F["ArrayBuffer"]
+    B -.->|"fewer than 2 replies"| H["QuorumUnavailable"]
 ```
 
 Repairs reuse the version from the read instead of minting a new one, and they carry the
@@ -112,36 +112,38 @@ own never generates a write, but a read still repairs if the two replies disagre
 | Write / delete         | 6       | 2                                  |
 | Read that needs repair | 6       | 2                                  |
 
-Those counts exclude the Worker entry point, object startup, storage work, alarms, and queueing.
+Those counts exclude the Worker entrypoint, object startup, storage work, alarms, and queueing.
 There is no local-read lease, and because every key is pinned to a single three-replica shard,
 per-key throughput is bounded by one Durable Object rather than scaling with the shard count.
 
-## HTTP API
+## RPC API
 
-| Method   | Path                   | Success          | Notes                                          |
-| -------- | ---------------------- | ---------------- | ---------------------------------------------- |
-| `GET`    | `/kv/:key`             | `200`, raw bytes | `404` when absent, deleted, or expired         |
-| `PUT`    | `/kv/:key?ttl=seconds` | `204`            | Raw binary body; positive fractional TTLs work |
-| `DELETE` | `/kv/:key`             | `204`            | Also succeeds when the key is already absent   |
+`Api` is a `WorkerEntrypoint` exported from `src/index.ts`. Bind it from another Worker with
+`Cloudflare.WorkerEntrypoint<Api>(worker, "Api")`; callers then use normal async methods.
 
-Keys are URL-encoded UTF-8 and capped at 1024 bytes. Values default to a 1 MiB limit and can be
-raised with `MAX_VALUE_BYTES`. A body over the limit returns `413`; `QuorumKV.put` throws a
-`RangeError` before any replica RPC happens. The HTTP layer counts streamed bytes rather than
-trusting `Content-Length`.
+| Method   | Signature                          | Result                                                    |
+| -------- | ---------------------------------- | --------------------------------------------------------- |
+| `get`    | `get(key)`                         | `ArrayBuffer`, or `null` when absent, deleted, or expired |
+| `put`    | `put(key, value, { ttlSeconds? })` | Resolves after the write quorum                           |
+| `delete` | `delete(key)`                      | Resolves after the delete quorum; absent keys are fine    |
+
+Keys are UTF-8 strings capped at 1024 bytes. Values default to a 1 MiB limit and can be raised
+with `MAX_VALUE_BYTES`. `put` throws `RangeError` for an invalid key, invalid TTL, or oversized
+value before any replica RPC happens.
 
 The default value limit leaves room for key and version metadata under the
 [8 MB SQLite row limit](https://developers.cloudflare.com/durable-objects/platform/limits/index.md).
 If you raise it, leave that overhead in place. An empty value is a real value and is distinct
 from a missing key.
 
-Other responses: `400` for an invalid key encoding, bad key length, or invalid TTL, `405` for
-unsupported methods, and `503` when no quorum is available.
+All methods fail with `QuorumUnavailable` when fewer than two replicas answer within the phase
+timeout. RPC arguments arrive as structured-clone values, so the value is already in memory;
+there is no streamed-body limit at the entrypoint.
 
-## Seeing what happened
-
-Send `X-KV-Debug: 1` and the response includes `X-KV-Quorum`: JSON listing the replicas that
-answered and the latency of each phase. It is the quickest way to confirm which two replicas
-made a request succeed.
+Across the RPC boundary, `RangeError` arrives as a real `RangeError`. Custom error classes do
+not survive intact, so `QuorumUnavailable` arrives as a plain `Error` with
+`name: "QuorumUnavailable"` and `code: "QUORUM_UNAVAILABLE"`. Check those properties rather than
+using `instanceof QuorumUnavailable`.
 
 ## Configuration
 
@@ -234,16 +236,16 @@ boundary around an expiration.
 
 ```sh
 npm ci
-npm run check        # TypeScript, Oxlint, Oxfmt check, and both Vitest projects
+npm run check        # TypeScript, Oxlint, Oxfmt check, and the Vitest suite
 npm run format       # apply Oxfmt
 ```
 
-`npm test` runs both Vitest projects locally by default, without Cloudflare credentials or
-cloud state-store bootstrap.
+`npm test` runs the suite locally by default, without Cloudflare credentials or cloud
+state-store bootstrap.
 
 ### Testing Durable Objects
 
-`npm run test:workers` runs the detailed KV suite using Cloudflare's official
+`npm run test:workers` runs the KV suite using Cloudflare's official
 [Workers Vitest integration](https://developers.cloudflare.com/workers/testing/vitest-integration/)
 (`@cloudflare/vitest-plugin`). Tests and the real SQLite Durable Objects run inside workerd.
 Tests access bindings through `cloudflare:workers` and use `cloudflare:test` for instance and
@@ -252,41 +254,26 @@ storage inspection, alarm delivery, and eviction.
 Fault injection uses Vitest prototype spies scoped to selected instances, entirely in
 `test/fixtures.ts`. After each test, background contexts drain, spies are restored, and binding
 storage is reset. Only this project's Vitest configuration sets `SYNC_BATCH=4` for pagination
-coverage; the runtime has no test flag, debug HTTP bridge, or fault-injection RPCs.
-
-### Public-HTTP smoke tests
-
-`npm run test:http` exercises the uninstrumented Worker using Alchemy's
-[Test harness](https://alchemy.run/testing/test-harness): `Test.make` from
-`@alchemy.run/test/Vitest`, one `beforeAll(deploy(Stack))`, and one `afterAll(destroy(Stack))`.
-The `quorum-kv-test` stack in `test/stack.ts` uses the production Worker factory without extra
-bindings and keeps Alchemy state locally under `.alchemy/`. Requests use the deployed URL
-from the setup output handle, never a hard-coded localhost URL. Only the startup probe is
-retried; test requests are not.
-
-### Running tests against the real thing
-
-`ALCHEMY_TEST_DEV=0 npm run test:http` runs the HTTP smoke tests live with a configured
-Cloudflare profile; `ALCHEMY_TEST_DEV=1` forces local mode. The detailed fault and storage suite
-always runs locally in the Workers runtime, not against a remote deployment. Stage names are
-random unless `ALCHEMY_TEST_STAGE` is set, and any explicit stage must also be disposable.
-
-Never point a test run at an existing deployment: the harness destroys its test stack after
-the suite.
+coverage; the runtime has no test flag, debug bridge, or fault-injection RPCs.
 
 ## Running and deploying
 
-`npm run dev` starts Alchemy local development at <http://localhost:31463>; override the port
-with `PORT`. Alchemy keeps deployment state in the Cloudflare state store, so both local
-development and `npm run deploy` need a configured Cloudflare profile. On first use,
-`Cloudflare.state()` deploys or adopts the account-level `alchemy-state-store` Worker.
-This production/dev state backend is separate from the test stack's local state; local tests
-never deploy cloud resources.
+`npm run dev` starts Alchemy local development. The Worker has no HTTP handler; it exposes
+`Api` over a service binding and hosts the `Replica` Durable Objects. Use the Vitest suite, or
+bind the entrypoint from another Worker, to exercise it. Override the local port with `PORT` if
+needed.
+
+Alchemy keeps deployment state in the Cloudflare state store, so both local development and
+`npm run deploy` need a configured Cloudflare profile. On first use, `Cloudflare.state()`
+deploys or adopts the account-level `alchemy-state-store` Worker. This production/dev state
+backend is separate from the test stack's local state; local tests never deploy cloud
+resources.
 
 ## Please don't ship this as-is
 
-The HTTP endpoint has no authentication. Keep it local, or put access control in front of it
-before exposing a deployment.
+The `Api` entrypoint has no per-caller authorization. Service bindings keep it off the public
+internet, but any Worker with the binding can read and write every key. Restrict who can bind
+it, or add access control in front of it, before treating it as multi-tenant.
 
 The local tests exercise failure and ordering behavior — not real regional placement, network
 partitions, clock synchronization, or production latency.

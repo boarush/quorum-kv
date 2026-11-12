@@ -18,9 +18,6 @@ export default defineConfig({
         ],
         test: { name: "workers", include: ["test/kv.test.ts"], testTimeout: 30_000 },
       },
-      {
-        test: { name: "http", include: ["test/http.test.ts"], testTimeout: 30_000 },
-      },
     ],
   },
 });

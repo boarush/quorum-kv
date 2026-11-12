@@ -1,18 +1,9 @@
 import { it, expect, vi } from "vitest";
+import { exports as workerExports } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
-import {
-  setup,
-  drain,
-  workerRequest,
-  request,
-  alarm,
-  age,
-  inspect,
-  expirationPlans,
-  evict,
-  setFault,
-} from "./fixtures";
+import { setup, drain, alarm, age, inspect, expirationPlans, evict, setFault } from "./fixtures";
 import { config } from "../src/config";
+import { Api } from "../src/index";
 import { QuorumKV, QuorumUnavailable } from "../src/coordinator";
 import { compare, type RecordValue } from "../src/model";
 import { Replica } from "../src/replica";
@@ -23,27 +14,52 @@ const text = (value: ArrayBuffer | null) =>
   value === null ? null : new TextDecoder().decode(value);
 const stamped = (record: RecordValue) => ({ ...record, writtenAt: Date.now() });
 const pause = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+const errorFrom = (operation: () => Promise<unknown>) =>
+  operation().catch((cause: unknown) => cause);
 
-it("roundtrips raw bytes and empty values through the Worker and real SQLite DOs", async () => {
+it("roundtrips raw bytes and empty values through QuorumKV and real SQLite DOs", async () => {
   const h = await setup();
   const raw = new Uint8Array([0, 255, 128, 13, 10]);
-  expect((await h.request()).status).toBe(404);
-  expect((await h.request("PUT", raw)).status).toBe(204);
-  const get = await h.request();
-  expect(get.status).toBe(200);
-  expect(new Uint8Array(await get.arrayBuffer())).toEqual(raw);
-  expect(get.headers.get("Cache-Control")).toBe("no-store");
-  expect((await h.request("PUT", "")).status).toBe(204);
-  expect((await h.request()).status).toBe(200);
-  expect((await h.request()).headers.get("Content-Type")).toBe("application/octet-stream");
+  expect(await h.kv.get(h.key)).toBeNull();
+  await h.kv.put(h.key, raw.buffer as ArrayBuffer);
+  expect(new Uint8Array((await h.kv.get(h.key))!)).toEqual(raw);
+  await h.kv.put(h.key, new ArrayBuffer(0));
+  expect((await h.kv.get(h.key))!.byteLength).toBe(0);
 });
 
-it("dispatches requests through the Worker export and its real replica binding", async () => {
-  const { key } = await setup();
-  const put = await workerRequest(`/kv/${key}`, { method: "PUT", body: "edge" });
-  expect(put.status).toBe(204);
-  const get = await workerRequest(`/kv/${key}`);
-  expect(text(await get.arrayBuffer())).toBe("edge");
+it("dispatches calls through the Api WorkerEntrypoint and its real replica binding", async () => {
+  const h = await setup();
+  const api = new Api(h.ctx, h.bindings);
+  await api.put(h.key, bytes("edge"));
+  expect(text(await api.get(h.key))).toBe("edge");
+  await api.delete(h.key);
+  expect(await api.get(h.key)).toBeNull();
+});
+
+it("preserves validation and quorum errors across the Api RPC boundary", async () => {
+  const h = await setup();
+  const api = workerExports.Api({});
+
+  expect(await errorFrom(() => api.get(""))).toBeInstanceOf(RangeError);
+  expect(await errorFrom(() => api.put(h.key, bytes("bad"), { ttlSeconds: 0 }))).toBeInstanceOf(
+    RangeError,
+  );
+
+  await Promise.all(h.replicas.slice(0, 2).map(({ stub }) => setFault(stub, { fail: true })));
+  for (const operation of [
+    () => api.get(h.key),
+    () => api.put(h.key, bytes("no-quorum")),
+    () => api.delete(h.key),
+  ]) {
+    const error = await errorFrom(operation);
+    expect(error).toBeInstanceOf(Error);
+    expect(error).not.toBeInstanceOf(QuorumUnavailable);
+    expect(error).toMatchObject({
+      name: "QuorumUnavailable",
+      code: "QUORUM_UNAVAILABLE",
+      message: "Replica quorum unavailable",
+    });
+  }
 });
 
 it("reads its writes, with strictly increasing versions on sequential overwrites", async () => {
@@ -87,7 +103,6 @@ it("deletes with a versioned tombstone and permits recreation", async () => {
   const written = await h.replicas[0]!.stub.readVersion(h.key);
   await h.kv.delete(h.key);
   expect(await h.kv.get(h.key)).toBeNull();
-  expect((await h.request()).status).toBe(404);
   await drain(h.ctx);
   const deleted = await h.replicas[0]!.stub.read(h.key);
   expect(deleted.value).toBeNull();
@@ -113,10 +128,10 @@ it("serves reads, writes, and deletes when any one replica is down", async () =>
   for (let down = 0; down < 3; down++) {
     const h = await setup();
     await setFault(h.replicas[down]!.stub, { fail: true });
-    expect((await h.request("PUT", "available")).status).toBe(204);
-    expect(text(await (await h.request()).arrayBuffer())).toBe("available");
-    expect((await h.request("DELETE")).status).toBe(204);
-    expect((await h.request()).status).toBe(404);
+    await h.kv.put(h.key, bytes("available"));
+    expect(text(await h.kv.get(h.key))).toBe("available");
+    await h.kv.delete(h.key);
+    expect(await h.kv.get(h.key)).toBeNull();
     await setFault(h.replicas[down]!.stub, {});
   }
 });
@@ -125,8 +140,8 @@ it("takes the fastest two replicas without waiting for a slow replica or its tim
   const h = await setup({ REPLICA_TIMEOUT_MS: "250" });
   await setFault(h.replicas[2]!.stub, { delayMs: 600 });
   const start = Date.now();
-  expect((await h.request("PUT", "fast")).status).toBe(204);
-  expect(text(await (await h.request()).arrayBuffer())).toBe("fast");
+  await h.kv.put(h.key, bytes("fast"));
+  expect(text(await h.kv.get(h.key))).toBe("fast");
   expect(Date.now() - start).toBeLessThan(250);
   await pause(650); // Drain late RPCs before resetting their storage.
 });
@@ -135,17 +150,21 @@ it("takes the fastest two replicas without waiting for a slow replica within its
   const h = await setup({ REPLICA_TIMEOUT_MS: "1000" });
   await setFault(h.replicas[2]!.stub, { delayMs: 500 });
   const start = Date.now();
-  expect((await h.request("PUT", "fast")).status).toBe(204);
-  expect(text(await (await h.request()).arrayBuffer())).toBe("fast");
+  await h.kv.put(h.key, bytes("fast"));
+  expect(text(await h.kv.get(h.key))).toBe("fast");
   expect(Date.now() - start).toBeLessThan(250);
   await pause(550); // Drain late RPCs before resetting their storage.
 });
 
-it("returns 503 without quorum instead of serving a lone replica", async () => {
+it("throws QuorumUnavailable without quorum instead of serving a lone replica", async () => {
   const h = await setup();
   await Promise.all(h.replicas.slice(0, 2).map(({ stub }) => setFault(stub, { fail: true })));
-  for (const method of ["GET", "PUT", "DELETE"]) {
-    expect((await h.request(method, method === "PUT" ? "no-quorum" : undefined)).status).toBe(503);
+  for (const operation of [
+    () => h.kv.get(h.key),
+    () => h.kv.put(h.key, bytes("no-quorum")),
+    () => h.kv.delete(h.key),
+  ]) {
+    await expect(operation()).rejects.toBeInstanceOf(QuorumUnavailable);
   }
 });
 
@@ -175,7 +194,7 @@ it("bounds unresponsive quorum attempts with per-replica timeouts", async () => 
   const h = await setup({ REPLICA_TIMEOUT_MS: "60" });
   await Promise.all(h.replicas.slice(0, 2).map(({ stub }) => setFault(stub, { delayMs: 300 })));
   const start = Date.now();
-  expect((await h.request()).status).toBe(503);
+  await expect(h.kv.get(h.key)).rejects.toBeInstanceOf(QuorumUnavailable);
   expect(Date.now() - start).toBeLessThan(250);
   await pause(320);
 });
@@ -323,46 +342,27 @@ it("garbage-collects tombstones without extending grace on duplicate write-back"
   expect((await stub.readVersion(h.key)).counter).toBe(0);
 });
 
-it("reports answering replicas and per-phase latency only when requested", async () => {
+it("records answering replicas and per-phase latency", async () => {
   const h = await setup();
-  expect((await h.request("PUT", "debug", "", true)).headers.get("X-KV-Quorum")).not.toBeNull();
-  const result = await h.request("GET", undefined, "", true);
-  const phases = JSON.parse(result.headers.get("X-KV-Quorum")!);
-  expect(phases).toHaveLength(1);
-  expect(phases[0].answers).toHaveLength(2);
-  expect(phases[0].answers[0].replica).toMatch(/^shard-\d+-r[012]$/);
-  expect(phases[0].answers[0].latencyMs).toBeGreaterThanOrEqual(0);
-  expect((await h.request()).headers.get("X-KV-Quorum")).toBeNull();
+  await h.kv.put(h.key, bytes("debug"));
+  expect(h.kv.phases.map(phase => phase.name)).toEqual(["version", "write"]);
+  for (const phase of h.kv.phases) {
+    expect(phase.answers).toHaveLength(2);
+    expect(phase.answers[0]!.replica).toMatch(/^shard-\d+-r[012]$/);
+    expect(phase.answers[0]!.latencyMs).toBeGreaterThanOrEqual(0);
+  }
 });
 
-it("rejects malformed input, unsupported methods, and oversized values", async () => {
+it("rejects invalid keys, TTLs, and oversized values", async () => {
   const h = await setup();
-  for (const ttl of ["0", "-1", "NaN", "Infinity", "1e300", ""]) {
-    expect((await h.request("PUT", "bad", `?ttl=${ttl}`)).status).toBe(400);
+  for (const ttlSeconds of [0, -1, NaN, Infinity, 1e300]) {
+    await expect(h.kv.put(h.key, bytes("bad"), { ttlSeconds })).rejects.toBeInstanceOf(RangeError);
   }
-  expect((await h.request("POST")).status).toBe(405);
-  expect((await h.request("PUT", new Uint8Array(1024 * 1024 + 1))).status).toBe(413);
-  for (const path of ["/kv/", "/kv/%XX", `/kv/${"k".repeat(1025)}`]) {
-    expect((await request(path)).status).toBe(400);
-  }
-  expect((await request("/elsewhere")).status).toBe(404);
-});
-
-it("sets no-store on error responses", async () => {
-  const h = await setup();
-  const ttl = await h.request("PUT", "bad", "?ttl=0");
-  expect(ttl.status).toBe(400);
-  expect(ttl.headers.get("Cache-Control")).toBe("no-store");
-  const method = await h.request("POST");
-  expect(method.status).toBe(405);
-  expect(method.headers.get("Cache-Control")).toBe("no-store");
-  const oversized = await h.request("PUT", new Uint8Array(1024 * 1024 + 1));
-  expect(oversized.status).toBe(413);
-  expect(oversized.headers.get("Cache-Control")).toBe("no-store");
-  await Promise.all(h.replicas.slice(0, 2).map(({ stub }) => setFault(stub, { fail: true })));
-  const unavailable = await h.request();
-  expect(unavailable.status).toBe(503);
-  expect(unavailable.headers.get("Cache-Control")).toBe("no-store");
+  await expect(h.kv.get("")).rejects.toBeInstanceOf(RangeError);
+  await expect(h.kv.get("k".repeat(1025))).rejects.toBeInstanceOf(RangeError);
+  await expect(h.kv.put(h.key, new ArrayBuffer(1024 * 1024 + 1))).rejects.toBeInstanceOf(
+    RangeError,
+  );
 });
 
 it("uses stable fixed shards, distinct hints, and validates topology configuration", async () => {
@@ -389,15 +389,8 @@ it("bounds timer configuration and isolates the default hints", async () => {
   expect(config(h.bindings).hints).toEqual(["apac", "me", "weur"]);
 });
 
-it("has no debug HTTP routes or fault-injection RPC methods", async () => {
+it("has no fault-injection RPC methods", async () => {
   const h = await setup();
-  for (const path of [
-    "/debug/fault",
-    "/_debug/request",
-    `/_debug/replica/${h.replicas[0]!.name}`,
-  ]) {
-    expect((await workerRequest(path, { method: "POST", body: "{}" })).status).toBe(404);
-  }
   await runInDurableObject(h.replicas[0]!.stub, instance => {
     expect(instance).not.toHaveProperty("setFault");
     expect(instance).not.toHaveProperty("debug");
@@ -753,13 +746,11 @@ it("syncs retained expired versions even when their deadline predates grace", as
   expect(synced.value).toBeNull();
 });
 
-it("enforces the configurable byte limit for HTTP and the programmatic API before RPCs", async () => {
+it("enforces the configurable byte limit before RPCs", async () => {
   const h = await setup({ MAX_VALUE_BYTES: "4" });
-  expect((await h.request("PUT", new Uint8Array(4))).status).toBe(204);
-  expect((await h.request("PUT", new Uint8Array(5))).status).toBe(413);
-  expect((await h.request("PUT", "ééé")).status).toBe(413);
   const phases = h.kv.phases.length;
   await expect(h.kv.put(h.key, new ArrayBuffer(5))).rejects.toBeInstanceOf(RangeError);
+  await expect(h.kv.put(h.key, bytes("ééé"))).rejects.toBeInstanceOf(RangeError);
   expect(h.kv.phases).toHaveLength(phases);
   await h.kv.put(h.key, new ArrayBuffer(4));
   expect((await h.kv.get(h.key))!.byteLength).toBe(4);
@@ -774,25 +765,4 @@ it("accepts the default 1 MiB boundary and rejects a larger programmatic value",
   await h.kv.put(h.key, new ArrayBuffer(size));
   expect((await h.kv.get(h.key))!.byteLength).toBe(size);
   await expect(h.kv.put(h.key, new ArrayBuffer(size + 1))).rejects.toBeInstanceOf(RangeError);
-});
-
-it("bounds streamed bodies by actual bytes instead of trusting Content-Length", async () => {
-  const h = await setup({ MAX_VALUE_BYTES: "4" });
-  const body = new ReadableStream<Uint8Array>({
-    start(controller) {
-      controller.enqueue(new Uint8Array(3));
-      controller.enqueue(new Uint8Array(2));
-      controller.close();
-    },
-  });
-  const response = await request(
-    `/kv/${h.key}`,
-    {
-      method: "PUT",
-      body,
-      headers: { "Content-Length": "1" },
-    },
-    h.bindings,
-  );
-  expect(response.status).toBe(413);
 });

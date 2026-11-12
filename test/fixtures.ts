@@ -1,4 +1,4 @@
-import { env, exports } from "cloudflare:workers";
+import { env } from "cloudflare:workers";
 import {
   createExecutionContext,
   waitOnExecutionContext,
@@ -8,7 +8,6 @@ import {
   reset,
 } from "cloudflare:test";
 import { afterEach, beforeEach, vi } from "vitest";
-import worker from "../src/index";
 import type { Env } from "../src/config";
 import { QuorumKV } from "../src/coordinator";
 import { Replica } from "../src/replica";
@@ -44,30 +43,8 @@ export async function setup(overrides: Partial<Env> = {}) {
     ctx,
     bindings,
     replicas,
-    request: (method = "GET", body?: BodyInit, suffix = "", debug = false) =>
-      request(
-        `/kv/${key}${suffix}`,
-        { method, body, headers: debug ? { "X-KV-Debug": "1" } : {} },
-        overrides,
-      ),
   };
 }
-
-export async function request(path: string, init: RequestInit = {}, overrides: Partial<Env> = {}) {
-  const ctx = createExecutionContext();
-  contexts.push(ctx);
-  const response = await worker.fetch(
-    new Request(`https://kv.test${path}`, init),
-    { ...env, ...overrides },
-    ctx,
-  );
-  // Timing tests observe the response before the slow third RPC drains.
-  if (overrides.REPLICA_TIMEOUT_MS === undefined) await drain(ctx);
-  return response;
-}
-
-export const workerRequest = (path: string, init?: RequestInit) =>
-  exports.default.fetch(`https://kv.test${path}`, init);
 
 // RPC methods must stay on the prototype. Select faults by the real instance,
 // without adding fields or methods to it or changing production bindings.
