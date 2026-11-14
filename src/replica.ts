@@ -24,7 +24,7 @@ const recordValue = (row: Row): RecordValue => ({
 export class Replica extends DurableObject<Env> {
   private readonly options;
   private readonly name: string;
-  private readonly peers: { name: string; stub: DurableObjectStub<Replica> }[];
+  private readonly peers: { name: string; locationHint: DurableObjectLocationHint }[];
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -36,14 +36,7 @@ export class Replica extends DurableObject<Env> {
     this.name = name;
     this.peers = this.options.hints.flatMap((locationHint, i) => {
       const peer = name.replace(/r[012]$/, `r${i}`);
-      return peer === name
-        ? []
-        : [
-            {
-              name: peer,
-              stub: env.REPLICAS.get(env.REPLICAS.idFromName(peer), { locationHint }),
-            },
-          ];
+      return peer === name ? [] : [{ name: peer, locationHint }];
     });
     const sql = ctx.storage.sql;
     sql.exec(`CREATE TABLE IF NOT EXISTS records (
@@ -177,7 +170,11 @@ export class Replica extends DurableObject<Env> {
     return { rows, cursor, more, bytes };
   }
 
-  private async sync(peer: { name: string; stub: DurableObjectStub<Replica> }) {
+  private async sync(peer: { name: string; locationHint: DurableObjectLocationHint }) {
+    // A stub that threw may stay broken, so mint a fresh one per sync instead of caching.
+    const stub = this.env.REPLICAS.get(this.env.REPLICAS.idFromName(peer.name), {
+      locationHint: peer.locationHint,
+    });
     let cursor = this.ctx.storage.sql
       .exec<{ cursor: number }>("SELECT cursor FROM peers WHERE name = ?", peer.name)
       .one().cursor;
@@ -191,7 +188,7 @@ export class Replica extends DurableObject<Env> {
       let timer: ReturnType<typeof setTimeout> | undefined;
       try {
         const batch = await Promise.race([
-          peer.stub.pull(this.name, cursor),
+          stub.pull(this.name, cursor),
           new Promise<never>((_, reject) => {
             timer = setTimeout(() => reject(new Error("Sync timeout")), remaining);
           }),
