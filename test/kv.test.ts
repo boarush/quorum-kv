@@ -1,12 +1,22 @@
 import { it, expect, vi } from "vitest";
 import { exports as workerExports } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
-import { setup, drain, alarm, age, inspect, expirationPlans, evict, setFault } from "./fixtures";
+import {
+  setup,
+  drain,
+  alarm,
+  age,
+  inspect,
+  expirationPlans,
+  evict,
+  setFault,
+  type TestReplicas,
+} from "./fixtures";
 import { config } from "../src/config";
-import { Api } from "../src/index";
-import { QuorumKV, QuorumUnavailable } from "../src/coordinator";
+import { QuorumKV, QuorumUnavailable } from "quorum-kv";
+import { Api, Replica } from "quorum-kv/workers";
+import embeddedWorker from "../examples/embedded/worker";
 import { compare, type RecordValue } from "../src/model";
-import { Replica } from "../src/replica";
 import { SYNC_ALARM_PULLS, SYNC_BATCH_BYTES } from "../src/sync";
 
 const bytes = (value: string) => new TextEncoder().encode(value).buffer as ArrayBuffer;
@@ -25,6 +35,38 @@ it("roundtrips raw bytes and empty values through QuorumKV and real SQLite DOs",
   expect(new Uint8Array((await h.kv.get(h.key))!)).toEqual(raw);
   await h.kv.put(h.key, new ArrayBuffer(0));
   expect((await h.kv.get(h.key))!.byteLength).toBe(0);
+});
+
+it("embeds the public library in a consumer Worker without the Api service", async () => {
+  const h = await setup();
+  const kv = new QuorumKV(h.bindings, h.ctx);
+  const request = new Request("https://example.com/");
+  expect((await embeddedWorker.fetch(request, h.bindings, h.ctx)).status).toBe(404);
+  await kv.put("hello", bytes("embedded"), { ttlSeconds: 60 });
+  const response = await embeddedWorker.fetch(request, h.bindings, h.ctx);
+  expect(await response.text()).toBe("embedded");
+  await kv.delete("hello");
+  expect((await embeddedWorker.fetch(request, h.bindings, h.ctx)).status).toBe(404);
+  expect(kv).not.toHaveProperty("phases");
+  expect(kv).not.toHaveProperty("replicas");
+});
+
+it("does not let an observer failure change storage results", async () => {
+  const h = await setup();
+  const observer = vi.fn(() => {
+    throw new Error("Observer failure");
+  });
+  const kv = new QuorumKV(h.bindings, h.ctx, { onPhase: observer });
+  await kv.put(h.key, bytes("observed"));
+  expect(text(await kv.get(h.key))).toBe("observed");
+  await kv.delete(h.key);
+  await drain(h.ctx);
+  expect(observer.mock.calls).toHaveLength(5);
+
+  await Promise.all(h.replicas.slice(0, 2).map(({ stub }) => setFault(stub, { fail: true })));
+  await expect(kv.get(h.key)).rejects.toBeInstanceOf(QuorumUnavailable);
+  await drain(h.ctx);
+  expect(observer.mock.calls).toHaveLength(6);
 });
 
 it("dispatches calls through the Api WorkerEntrypoint and its real replica binding", async () => {
@@ -185,7 +227,8 @@ it("rejects a read when the repair quorum is unavailable", async () => {
   await setFault(h.replicas[2]!.stub, { delayMs: 100 });
   vi.spyOn(Replica.prototype, "write").mockRejectedValue(new Error("Injected repair failure"));
   await expect(h.kv.get(h.key)).rejects.toBeInstanceOf(QuorumUnavailable);
-  expect(h.kv.phases.map(phase => phase.name)).toEqual(["read", "repair"]);
+  expect(h.phases.at(-1)!.answers).toHaveLength(0);
+  expect(h.phases.map(phase => phase.name)).toEqual(["read", "repair"]);
   await drain(h.ctx);
   await setFault(h.replicas[2]!.stub, {});
 });
@@ -208,7 +251,7 @@ it("repairs a stale third replica when it participates in a read quorum", async 
   expect((await h.replicas[2]!.stub.readVersion(h.key)).counter).toBe(0);
   await setFault(h.replicas[1]!.stub, { delayMs: 100 });
   expect(text(await h.kv.get(h.key))).toBe("repaired");
-  expect(h.kv.phases.at(-1)!.name).toBe("repair");
+  expect(h.phases.at(-1)!.name).toBe("repair");
   await drain(h.ctx);
   const records = await Promise.all(h.replicas.map(({ stub }) => stub.read(h.key)));
   expect(records.map(record => text(record.value))).toEqual(["repaired", "repaired", "repaired"]);
@@ -345,8 +388,8 @@ it("garbage-collects tombstones without extending grace on duplicate write-back"
 it("records answering replicas and per-phase latency", async () => {
   const h = await setup();
   await h.kv.put(h.key, bytes("debug"));
-  expect(h.kv.phases.map(phase => phase.name)).toEqual(["version", "write"]);
-  for (const phase of h.kv.phases) {
+  expect(h.phases.map(phase => phase.name)).toEqual(["version", "write"]);
+  for (const phase of h.phases) {
     expect(phase.answers).toHaveLength(2);
     expect(phase.answers[0]!.replica).toMatch(/^shard-\d+-r[012]$/);
     expect(phase.answers[0]!.latencyMs).toBeGreaterThanOrEqual(0);
@@ -367,7 +410,16 @@ it("rejects invalid keys, TTLs, and oversized values", async () => {
 
 it("uses stable fixed shards, distinct hints, and validates topology configuration", async () => {
   const h = await setup();
-  expect((await h.kv.replicas(h.key)).map(r => r.name)).toEqual(h.replicas.map(r => r.name));
+  await h.kv.put(h.key, bytes("routing"));
+  await drain(h.ctx);
+  // The helper computes names independently; real writes must reach all three.
+  const records = await Promise.all(h.replicas.map(({ stub }) => stub.read(h.key)));
+  expect(records.map(record => text(record.value))).toEqual(["routing", "routing", "routing"]);
+  expect(text(await h.kv.get(h.key))).toBe("routing");
+  const names = h.replicas.map(replica => replica.name);
+  for (const phase of h.phases) {
+    expect(phase.answers.every(answer => names.includes(answer.replica))).toBe(true);
+  }
   expect(config(h.bindings).shards).toBe(1024);
   expect(config(h.bindings).hints).toEqual(["apac", "me", "weur"]);
   expect(() => config({ ...h.bindings, LOCATION_HINTS: "apac,apac,weur" })).toThrow();
@@ -397,13 +449,13 @@ it("has no fault-injection RPC methods", async () => {
   });
 });
 
-async function ageGc(replicas: Awaited<ReturnType<QuorumKV["replicas"]>>) {
+async function ageGc(replicas: TestReplicas) {
   for (const { stub } of replicas) {
     await age(stub, { gcAt: Date.now() - 1 });
   }
 }
 
-async function syncRounds(replicas: Awaited<ReturnType<QuorumKV["replicas"]>>, rounds = 3) {
+async function syncRounds(replicas: TestReplicas, rounds = 3) {
   for (let round = 0; round < rounds; round++) {
     for (const { stub } of replicas) await alarm(stub);
   }
@@ -748,10 +800,10 @@ it("syncs retained expired versions even when their deadline predates grace", as
 
 it("enforces the configurable byte limit before RPCs", async () => {
   const h = await setup({ MAX_VALUE_BYTES: "4" });
-  const phases = h.kv.phases.length;
+  const phases = h.phases.length;
   await expect(h.kv.put(h.key, new ArrayBuffer(5))).rejects.toBeInstanceOf(RangeError);
   await expect(h.kv.put(h.key, bytes("ééé"))).rejects.toBeInstanceOf(RangeError);
-  expect(h.kv.phases).toHaveLength(phases);
+  expect(h.phases).toHaveLength(phases);
   await h.kv.put(h.key, new ArrayBuffer(4));
   expect((await h.kv.get(h.key))!.byteLength).toBe(4);
   expect(config(h.bindings).maxValueBytes).toBe(4);

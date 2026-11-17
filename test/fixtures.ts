@@ -8,9 +8,9 @@ import {
   reset,
 } from "cloudflare:test";
 import { afterEach, beforeEach, vi } from "vitest";
-import type { Env } from "../src/config";
-import { QuorumKV } from "../src/coordinator";
-import { Replica } from "../src/replica";
+import { QuorumKV, type QuorumKVEnv, type Phase } from "quorum-kv";
+import { Replica } from "quorum-kv/workers";
+import { config } from "../src/config";
 import { COLLECT_GARBAGE, EXPIRE_RECORDS, SCHEDULE_EXPIRATION } from "../src/statements";
 
 export { runDurableObjectAlarm as alarm, evictDurableObject as evict };
@@ -25,20 +25,38 @@ afterEach(async () => {
   usedShards.clear();
 });
 
-export async function setup(overrides: Partial<Env> = {}) {
+export type TestReplicas = { name: string; stub: DurableObjectStub<Replica> }[];
+
+// Test-only knowledge of the persisted routing scheme, independent of coordinator internals.
+export async function replicasFor(key: string, bindings: QuorumKVEnv): Promise<TestReplicas> {
+  const options = config(bindings);
+  const hash = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(key));
+  const shard = new DataView(hash).getUint32(0) % options.shards;
+  return options.hints.map((locationHint, i) => {
+    const name = `shard-${shard}-r${i}`;
+    return {
+      name,
+      stub: bindings.REPLICAS.get(bindings.REPLICAS.idFromName(name), { locationHint }),
+    };
+  });
+}
+
+export async function setup(overrides: Partial<QuorumKVEnv> = {}) {
   const bindings = { ...env, ...overrides };
   const ctx = createExecutionContext();
   contexts.push(ctx);
-  const kv = new QuorumKV(bindings, ctx);
+  const phases: Phase[] = [];
+  const kv = new QuorumKV(bindings, ctx, { onPhase: phase => phases.push(phase) });
   let key: string;
-  let replicas: Awaited<ReturnType<QuorumKV["replicas"]>>;
+  let replicas: TestReplicas;
   do {
     key = crypto.randomUUID();
-    replicas = await kv.replicas(key);
+    replicas = await replicasFor(key, bindings);
   } while (usedShards.has(replicas[0]!.name));
   usedShards.add(replicas[0]!.name);
   return {
     kv,
+    phases,
     key,
     ctx,
     bindings,

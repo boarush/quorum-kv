@@ -12,6 +12,82 @@ The trade-off is deliberate. You get read and write availability while one repli
 slow, and you pay for it with two round trips per write, no local-read lease, and a per-key
 throughput ceiling of roughly one Durable Object.
 
+## Use it as a library
+
+quorum-kv is an ESM library for **Cloudflare Workers with SQLite Durable Objects**. It has no
+runtime npm dependencies. Embedding it in your own Worker avoids the extra service-binding hop;
+replica RPCs, alarms, and storage still run on Cloudflare. This is not a Node.js storage backend.
+
+Until the package is published, build and pack this checkout, then install the tarball in your
+Worker project:
+
+```sh
+npm ci
+npm pack                         # builds dist/ and creates quorum-kv-0.1.0.tgz
+# In your Worker project:
+npm install /path/to/quorum-kv/quorum-kv-0.1.0.tgz
+```
+
+```ts
+import { QuorumKV, type QuorumKVEnv } from "quorum-kv";
+
+export { Replica } from "quorum-kv/workers";
+
+export default {
+  async fetch(request, env, ctx) {
+    const kv = new QuorumKV(env, ctx);
+    const value = await kv.get("hello");
+    return value === null ? new Response(null, { status: 404 }) : new Response(value);
+  },
+} satisfies ExportedHandler<QuorumKVEnv>;
+```
+
+Add the binding and SQLite migration to your Worker's Wrangler configuration:
+
+```jsonc
+{
+  "durable_objects": {
+    "bindings": [{ "name": "REPLICAS", "class_name": "Replica" }],
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Replica"] }],
+}
+```
+
+Merge these into your own configuration and migration history; don't replace existing migrations.
+A complete read-only example is in `examples/embedded/`. Add your application's authorization
+before exposing stored data over HTTP. TypeScript consumers should use their generated Worker
+runtime types (`wrangler types`) or `@cloudflare/workers-types`, with `lib: ["ES2022"]` rather than
+browser DOM types.
+
+### Public exports
+
+| Import              | Exports                                                                                                                   |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| `quorum-kv`         | `QuorumKV`, `QuorumUnavailable`; types `QuorumKVEnv`, `ReplicaConfig`, `PutOptions`, `QuorumKVOptions`, `Phase`, `Answer` |
+| `quorum-kv/workers` | `Replica`, optional service-binding adapter `Api`                                                                         |
+
+`new QuorumKV(env, ctx, options?)` uses the same string environment bindings as the replicas.
+`ctx` only needs `waitUntil`; pass the current request's execution context and create the
+coordinator per request, not in module scope. Use `put(key, arrayBuffer, { ttlSeconds? })`,
+`get(key)`, and `delete(key)` directly. Locally, quorum errors support
+`instanceof QuorumUnavailable`; the RPC adapter has the serialization caveat described below.
+
+Diagnostics are opt-in and the coordinator does not retain a growing phase history:
+
+```ts
+const kv = new QuorumKV(env, ctx, {
+  onPhase: phase => console.log(phase.name, phase.answers),
+});
+```
+
+The synchronous callback receives a snapshot once each phase reaches quorum or fails, including
+its answering replicas and latencies. Thrown observer errors do not affect storage operations.
+If you retain these snapshots yourself, bound their lifetime and size.
+
+For a separate service instead, `examples/standalone/` re-exports `Api` and `Replica` and includes
+the Alchemy deployment. The root `alchemy.run.ts` forwards to that example, preserving the
+existing stack and Worker names. The coordinator\'s public methods are only `get`, `put`, and\n`delete`; replica routing is private. Source internals are not package export paths.
+
 ## How the pieces fit together
 
 A SHA-256 hash of the key picks one of 1024 fixed shards. Replica names follow the pattern
@@ -118,8 +194,10 @@ per-key throughput is bounded by one Durable Object rather than scaling with the
 
 ## RPC API
 
-`Api` is a `WorkerEntrypoint` exported from `src/index.ts`. Bind it from another Worker with
+`Api` is an optional `WorkerEntrypoint` exported from `quorum-kv/workers`. The standalone
+example exposes it. Bind it from another Worker with
 `Cloudflare.WorkerEntrypoint<Api>(worker, "Api")`; callers then use normal async methods.
+Embedded consumers call the same methods directly on `QuorumKV`.
 
 | Method   | Signature                          | Result                                                    |
 | -------- | ---------------------------------- | --------------------------------------------------------- |
@@ -147,8 +225,11 @@ using `instanceof QuorumUnavailable`.
 
 ## Configuration
 
-All of these are Worker environment bindings. Defaults live in `src/config.ts`, and overriding
-them in the Alchemy Worker environment keeps local and deployed behavior in sync.
+All of these are Worker environment bindings, described by the exported `ReplicaConfig` type.
+`QuorumKVEnv` adds the required `REPLICAS` namespace binding. Defaults live in `src/config.ts`.
+Configure these on the Worker hosting `Replica`, and pass the same bindings to `QuorumKV`.
+Don't independently override coordinator topology, value limits, or GC settings; coordinator and
+replicas need compatible configuration. No separate Alchemy runtime dependency is required.
 
 | Binding              | Default            | What it controls                                               |
 | -------------------- | ------------------ | -------------------------------------------------------------- |
@@ -236,12 +317,13 @@ boundary around an expiration.
 
 ```sh
 npm ci
+npm run build        # ESM JavaScript and declarations in dist/
 npm run check        # TypeScript, Oxlint, Oxfmt check, and the Vitest suite
 npm run format       # apply Oxfmt
 ```
 
-`npm test` runs the suite locally by default, without Cloudflare credentials or cloud
-state-store bootstrap.
+`npm test` builds the package and runs the suite locally, without Cloudflare credentials or
+cloud state-store bootstrap. The Node package tests install a local tarball offline, compile an\nisolated TypeScript consumer (including public-API boundary checks), then bundle and run that\ninstalled package inside workerd with real SQLite Durable Objects. Bundle inputs are checked to\nprevent accidentally resolving checkout source instead of the installed package. The test-only\nHTTP fixture is `test/consumer/worker.ts`; it is not shipped in the package. Workers tests also\nimport the built public exports and exercise embedded use, the optional RPC adapter, and faults.\n\n`.github/workflows/ci.yml` runs `npm ci`, `npm run check`, and `npm pack --dry-run` from clean\ncheckouts on Linux with the minimum supported Node version (24.11.1) and Node 26. It does not\ndeploy or require Cloudflare credentials.
 
 ### Testing Durable Objects
 
@@ -258,7 +340,9 @@ coverage; the runtime has no test flag, debug bridge, or fault-injection RPCs.
 
 ## Running and deploying
 
-`npm run dev` starts Alchemy local development. The Worker has no HTTP handler; it exposes
+`npm run dev` builds the library and starts the standalone example's Alchemy local development.
+Run `npm run build:watch` in a second terminal when editing library source so the example sees
+updated package output. The Worker has no HTTP handler; it exposes
 `Api` over a service binding and hosts the `Replica` Durable Objects. Use the Vitest suite, or
 bind the entrypoint from another Worker, to exercise it. Override the local port with `PORT` if
 needed.

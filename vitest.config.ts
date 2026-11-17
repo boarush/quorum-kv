@@ -4,10 +4,11 @@ import { defineConfig } from "vitest/config";
 export default defineConfig({
   test: {
     projects: [
+      { test: { name: "package", environment: "node", include: ["test/package.test.ts"] } },
       {
         plugins: [
           cloudflareTest({
-            main: "./src/index.ts",
+            main: "./examples/standalone/worker.ts",
             miniflare: {
               compatibilityDate: "2026-11-01",
               compatibilityFlags: ["nodejs_compat"],

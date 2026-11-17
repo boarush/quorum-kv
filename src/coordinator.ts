@@ -1,7 +1,7 @@
-import type { Env } from "./config";
-import { config } from "./config";
-import { compare, type RecordValue } from "./model";
-import type { Replica } from "./replica";
+import type { QuorumKVEnv } from "./config.js";
+import { config } from "./config.js";
+import { compare, type RecordValue } from "./model.js";
+import type { Replica } from "./replica.js";
 
 export class QuorumUnavailable extends Error {
   readonly code = "QUORUM_UNAVAILABLE";
@@ -12,17 +12,26 @@ export class QuorumUnavailable extends Error {
   }
 }
 
+export interface PutOptions {
+  ttlSeconds?: number;
+}
+
 export interface Answer {
-  replica: string;
-  latencyMs: number;
+  readonly replica: string;
+  readonly latencyMs: number;
 }
 
 export interface Phase {
-  name: string;
-  answers: Answer[];
+  readonly name: "read" | "version" | "write" | "repair";
+  readonly answers: readonly Answer[];
 }
 
-export async function shardFor(key: string, shards: number): Promise<number> {
+export interface QuorumKVOptions {
+  /** Synchronous observer, called once per settled phase. Thrown errors are ignored. */
+  onPhase?: (phase: Phase) => void;
+}
+
+async function shardFor(key: string, shards: number): Promise<number> {
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(key));
   return new DataView(digest).getUint32(0) % shards;
 }
@@ -35,16 +44,16 @@ function validateKey(key: string): void {
 
 export class QuorumKV {
   private readonly options;
-  readonly phases: Phase[] = [];
 
   constructor(
-    private readonly env: Env,
+    private readonly env: QuorumKVEnv,
     private readonly ctx: Pick<ExecutionContext, "waitUntil">,
+    private readonly diagnostics: QuorumKVOptions = {},
   ) {
     this.options = config(env);
   }
 
-  async replicas(key: string) {
+  async #replicas(key: string) {
     validateKey(key);
     const shard = await shardFor(key, this.options.shards);
     return this.options.hints.map((locationHint, i) => {
@@ -58,13 +67,19 @@ export class QuorumKV {
 
   private async quorum<T>(
     key: string,
-    name: string,
+    name: Phase["name"],
     call: (stub: DurableObjectStub<Replica>) => Promise<T>,
   ): Promise<T[]> {
-    const replicas = await this.replicas(key);
+    const replicas = await this.#replicas(key);
     const answers: Answer[] = [];
     const values: T[] = [];
-    this.phases.push({ name, answers });
+    const report = () => {
+      try {
+        this.diagnostics.onPhase?.({ name, answers: [...answers] });
+      } catch {
+        // Diagnostics must never change the outcome of a quorum operation.
+      }
+    };
     let failures = 0;
 
     const attempts = replicas.map(async ({ name: replica, stub }) => {
@@ -79,7 +94,7 @@ export class QuorumKV {
         ]);
         return { value, answer: { replica, latencyMs: Date.now() - start } };
       } finally {
-        clearTimeout(timer);
+        if (timer !== undefined) clearTimeout(timer);
       }
     });
     // Keep the third request alive after returning a quorum, without delaying the response.
@@ -91,10 +106,16 @@ export class QuorumKV {
             if (values.length === 2 || failures === 2) return;
             values.push(result.value);
             answers.push(result.answer);
-            if (values.length === 2) resolve(values);
+            if (values.length === 2) {
+              report();
+              resolve(values);
+            }
           },
           () => {
-            if (++failures === 2 && values.length < 2) reject(new QuorumUnavailable());
+            if (++failures === 2 && values.length < 2) {
+              report();
+              reject(new QuorumUnavailable());
+            }
           },
         );
       }
@@ -115,7 +136,7 @@ export class QuorumKV {
     return newest.expiresAt !== null && newest.expiresAt <= Date.now() ? null : newest.value;
   }
 
-  async put(key: string, value: ArrayBuffer, options: { ttlSeconds?: number } = {}): Promise<void> {
+  async put(key: string, value: ArrayBuffer, options: PutOptions = {}): Promise<void> {
     if (value.byteLength > this.options.maxValueBytes) {
       throw new RangeError(`Value exceeds ${this.options.maxValueBytes} bytes`);
     }

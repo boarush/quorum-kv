@@ -1,7 +1,7 @@
-import type { Replica } from "./replica";
+import type { Replica } from "./replica.js";
 
-export interface Env {
-  REPLICAS: DurableObjectNamespace<Replica>;
+/** String bindings shared by the coordinator and its replicas. */
+export interface ReplicaConfig {
   SHARDS?: string;
   LOCATION_HINTS?: string;
   REPLICA_TIMEOUT_MS?: string;
@@ -9,6 +9,11 @@ export interface Env {
   SYNC_MS?: string;
   SYNC_BATCH?: string;
   MAX_VALUE_BYTES?: string;
+}
+
+/** Bind REPLICAS to the SQLite-backed Replica Durable Object class. */
+export interface QuorumKVEnv extends ReplicaConfig {
+  REPLICAS: DurableObjectNamespace<Replica>;
 }
 
 export const DEFAULTS = {
@@ -39,7 +44,7 @@ export function positiveInteger(
   return n;
 }
 
-export function config(env: Env) {
+export function config(env: ReplicaConfig) {
   const hints =
     env.LOCATION_HINTS === undefined
       ? [...DEFAULTS.hints]

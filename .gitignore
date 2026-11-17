@@ -2,5 +2,7 @@ node_modules/
 .alchemy/
 .wrangler/
 coverage/
+dist/
+*.tgz
 .env
 .dev.vars

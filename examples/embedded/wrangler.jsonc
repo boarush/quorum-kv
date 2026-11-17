@@ -1,0 +1,9 @@
+{
+  "name": "quorum-kv-embedded",
+  "main": "./worker.ts",
+  "compatibility_date": "2026-11-01",
+  "durable_objects": {
+    "bindings": [{ "name": "REPLICAS", "class_name": "Replica" }],
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Replica"] }],
+}

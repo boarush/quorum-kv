@@ -1,9 +1,9 @@
 import { DurableObject } from "cloudflare:workers";
-import type { Env } from "./config";
-import { config } from "./config";
-import { compare, EMPTY, type RecordValue, type Version } from "./model";
-import { COLLECT_GARBAGE, EXPIRE_RECORDS, SCHEDULE_EXPIRATION } from "./statements";
-import { SYNC_ALARM_BYTES, SYNC_ALARM_PULLS, SYNC_BATCH_BYTES, syncRowBytes } from "./sync";
+import type { QuorumKVEnv } from "./config.js";
+import { config } from "./config.js";
+import { compare, EMPTY, type RecordValue, type Version } from "./model.js";
+import { COLLECT_GARBAGE, EXPIRE_RECORDS, SCHEDULE_EXPIRATION } from "./statements.js";
+import { SYNC_ALARM_BYTES, SYNC_ALARM_PULLS, SYNC_BATCH_BYTES, syncRowBytes } from "./sync.js";
 
 type Row = {
   key: string;
@@ -21,12 +21,12 @@ const recordValue = (row: Row): RecordValue => ({
   expiresAt: row.expires_at,
 });
 
-export class Replica extends DurableObject<Env> {
+export class Replica extends DurableObject<QuorumKVEnv> {
   private readonly options;
   private readonly name: string;
   private readonly peers: { name: string; locationHint: DurableObjectLocationHint }[];
 
-  constructor(ctx: DurableObjectState, env: Env) {
+  constructor(ctx: DurableObjectState, env: QuorumKVEnv) {
     super(ctx, env);
     this.options = config(env);
     // Named RPCs and their alarms preserve ctx.id.name in the current runtime.
@@ -206,7 +206,7 @@ export class Replica extends DurableObject<Env> {
         drained += batch.bytes;
         if (!batch.more || drained >= SYNC_ALARM_BYTES) break;
       } finally {
-        clearTimeout(timer);
+        if (timer !== undefined) clearTimeout(timer);
       }
     }
   }

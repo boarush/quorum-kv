@@ -1,16 +1,40 @@
 {
   "name": "quorum-kv",
-  "private": true,
+  "version": "0.1.0",
+  "description": "A quorum-replicated binary key-value store for Cloudflare Workers",
+  "files": [
+    "dist"
+  ],
   "type": "module",
+  "sideEffects": false,
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./workers": {
+      "types": "./dist/workers.d.ts",
+      "import": "./dist/workers.js"
+    }
+  },
   "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "build:watch": "tsc -p tsconfig.build.json --watch",
+    "prepack": "npm run build",
+    "pretest": "npm run build",
     "test": "vitest run",
+    "pretest:workers": "npm run build",
     "test:workers": "vitest run --project workers",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "npm run build && tsc --noEmit",
     "lint": "oxlint --deny-warnings",
     "format": "oxfmt",
     "format:check": "oxfmt --check",
     "check": "npm run typecheck && npm run lint && npm run format:check && npm test",
+    "predev": "npm run build",
     "dev": "alchemy dev",
+    "predeploy": "npm run build",
     "deploy": "alchemy deploy"
   },
   "devDependencies": {
@@ -20,6 +44,8 @@
     "@types/node": "^26.6.6",
     "alchemy": "2.0.0-beta.85",
     "effect": "^4.1.2",
+    "esbuild": "0.28.2",
+    "miniflare": "5.20261110.0-beta",
     "oxfmt": "^0.78.0",
     "oxlint": "^1.93.0",
     "typescript": "latest",
