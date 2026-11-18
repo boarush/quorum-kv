@@ -18,7 +18,7 @@ export default Alchemy.Stack(
   "quorum-kv",
   {
     providers: Cloudflare.providers(),
-    state: Cloudflare.state(),
+    state: Alchemy.localState(),
   },
   Effect.gen(function* () {
     const worker = yield* makeWorker("Api");

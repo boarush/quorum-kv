@@ -84,9 +84,10 @@ The synchronous callback receives a snapshot once each phase reaches quorum or f
 its answering replicas and latencies. Thrown observer errors do not affect storage operations.
 If you retain these snapshots yourself, bound their lifetime and size.
 
-For a separate service instead, `examples/standalone/` re-exports `Api` and `Replica` and includes
-the Alchemy deployment. The root `alchemy.run.ts` forwards to that example, preserving the
-existing stack and Worker names. The coordinator\'s public methods are only `get`, `put`, and\n`delete`; replica routing is private. Source internals are not package export paths.
+To try quorum-kv as a separate service, `examples/standalone/` re-exports `Api` and `Replica` and
+includes an Alchemy stack for testing. The root `alchemy.run.ts` forwards to that example.
+The coordinator's public methods are only `get`, `put`, and `delete`; replica routing is private.
+Source internals are not package export paths.
 
 ## How the pieces fit together
 
@@ -352,7 +353,7 @@ Fault injection uses Vitest prototype spies scoped to selected instances, entire
 storage is reset. Only this project's Vitest configuration sets `SYNC_BATCH=4` for pagination
 coverage; the runtime has no test flag, debug bridge, or fault-injection RPCs.
 
-## Running and deploying
+## Running the standalone test stack
 
 `npm run dev` builds the library and starts the standalone example's Alchemy local development.
 Run `npm run build:watch` in a second terminal when editing library source so the example sees
@@ -361,11 +362,10 @@ updated package output. The Worker has no HTTP handler; it exposes
 bind the entrypoint from another Worker, to exercise it. Override the local port with `PORT` if
 needed.
 
-Alchemy keeps deployment state in the Cloudflare state store, so both local development and
-`npm run deploy` need a configured Cloudflare profile. On first use, `Cloudflare.state()`
-deploys or adopts the account-level `alchemy-state-store` Worker. This production/dev state
-backend is separate from the test stack's local state; local tests never deploy cloud
-resources.
+The standalone stack is for testing. Alchemy keeps its state in `.alchemy/state/` rather than
+bootstrapping a Cloudflare state store. `npm run dev` runs locally; `npm run deploy` still
+deploys real test resources to Cloudflare and requires a configured Cloudflare profile. Use
+`npm test` for the local suite, which never deploys cloud resources.
 
 ## Please don't ship this as-is
 
