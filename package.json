@@ -38,29 +38,33 @@
     "deploy": "alchemy deploy"
   },
   "devDependencies": {
-    "@alchemy.run/cloudflare": "2.0.0-beta.85",
-    "@cloudflare/vitest-plugin": "1.7.0",
+    "@alchemy.run/cloudflare": "2.0.0-beta.87",
+    "@cloudflare/vitest-plugin": "1.8.4",
     "@cloudflare/workers-types": "latest",
+    "@effect/platform-node": "^4.1.4",
     "@types/node": "^26.6.6",
-    "alchemy": "2.0.0-beta.85",
-    "effect": "^4.1.2",
+    "alchemy": "2.0.0-beta.87",
+    "effect": "^4.1.4",
     "esbuild": "0.28.2",
-    "miniflare": "5.20261110.0-beta",
-    "oxfmt": "^0.78.0",
-    "oxlint": "^1.93.0",
-    "tsdown": "^0.22.14",
-    "typescript": "latest",
-    "vitest": "5.0.4",
-    "ws": "8.22.2"
+    "miniflare": "5.20261117.0-beta",
+    "oxfmt": "^0.79.0",
+    "oxlint": "^1.94.0",
+    "tsdown": "^0.23.7",
+    "typescript": "^7.0.2",
+    "vitest": "5.1.1",
+    "ws": "8.23.0"
   },
   "overrides": {
-    "workerd": "1.20261112.1"
+    "capnp-es": {
+      "typescript": "$typescript"
+    },
+    "workerd": "1.20261118.1"
   },
   "engines": {
     "node": ">=24.11.1"
   },
   "allowScripts": {
     "esbuild@0.28.2": true,
-    "workerd@1.20261112.1": true
+    "workerd@1.20261118.1": true
   }
 }
