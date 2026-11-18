@@ -183,7 +183,7 @@ repairs the lagging replicas first, then answers.
 
 ```mermaid
 flowchart TD
-    A["api.get(\"my-key\")"] --> B["Ask all 3 replicas,<br/>keep the first 2 full records"]
+    A["api.get('my-key')"] --> B["Ask all 3 replicas,<br/>keep the first 2 full records"]
     B --> C{"Versions match?"}
     C -->|yes| D{"Expired?"}
     C -->|no| E["Write the newest record back<br/>to all 3 replicas"]
@@ -360,10 +360,6 @@ installed package inside workerd with real SQLite Durable Objects. Bundle inputs
 prevent accidentally resolving checkout source instead of the installed package. The test-only
 HTTP fixture is `test/consumer/worker.ts`; it is not shipped in the package. Workers tests also
 import the built public exports and exercise embedded use, the optional RPC adapter, and faults.
-
-`.github/workflows/ci.yml` runs `npm ci`, `npm run check`, and `npm pack --dry-run` from clean
-checkouts on Linux with the minimum supported Node version (24.11.1) and Node 26. It does not
-deploy or require Cloudflare credentials.
 
 ### Testing Durable Objects
 
