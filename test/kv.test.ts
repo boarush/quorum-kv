@@ -179,7 +179,7 @@ it("serves reads, writes, and deletes when any one replica is down", async () =>
 });
 
 it("takes the fastest two replicas without waiting for a slow replica or its timeout", async () => {
-  const h = await setup({ REPLICA_TIMEOUT_MS: "250" });
+  const h = await setup({ QKV_REPLICA_TIMEOUT_MS: "250" });
   await setFault(h.replicas[2]!.stub, { delayMs: 600 });
   const start = Date.now();
   await h.kv.put(h.key, bytes("fast"));
@@ -189,7 +189,7 @@ it("takes the fastest two replicas without waiting for a slow replica or its tim
 });
 
 it("takes the fastest two replicas without waiting for a slow replica within its timeout", async () => {
-  const h = await setup({ REPLICA_TIMEOUT_MS: "1000" });
+  const h = await setup({ QKV_REPLICA_TIMEOUT_MS: "1000" });
   await setFault(h.replicas[2]!.stub, { delayMs: 500 });
   const start = Date.now();
   await h.kv.put(h.key, bytes("fast"));
@@ -234,7 +234,7 @@ it("rejects a read when the repair quorum is unavailable", async () => {
 });
 
 it("bounds unresponsive quorum attempts with per-replica timeouts", async () => {
-  const h = await setup({ REPLICA_TIMEOUT_MS: "60" });
+  const h = await setup({ QKV_REPLICA_TIMEOUT_MS: "60" });
   await Promise.all(h.replicas.slice(0, 2).map(({ stub }) => setFault(stub, { delayMs: 300 })));
   const start = Date.now();
   await expect(h.kv.get(h.key)).rejects.toBeInstanceOf(QuorumUnavailable);
@@ -403,7 +403,7 @@ it("rejects invalid keys, TTLs, and oversized values", async () => {
   }
   await expect(h.kv.get("")).rejects.toBeInstanceOf(RangeError);
   await expect(h.kv.get("k".repeat(1025))).rejects.toBeInstanceOf(RangeError);
-  await expect(h.kv.put(h.key, new ArrayBuffer(1024 * 1024 + 1))).rejects.toBeInstanceOf(
+  await expect(h.kv.put(h.key, new ArrayBuffer(4 * 1024 * 1024 + 1))).rejects.toBeInstanceOf(
     RangeError,
   );
 });
@@ -420,25 +420,28 @@ it("uses stable fixed shards, distinct hints, and validates topology configurati
   for (const phase of h.phases) {
     expect(phase.answers.every(answer => names.includes(answer.replica))).toBe(true);
   }
-  expect(config(h.bindings).shards).toBe(1024);
-  expect(config(h.bindings).hints).toEqual(["apac", "me", "weur"]);
-  expect(() => config({ ...h.bindings, LOCATION_HINTS: "apac,apac,weur" })).toThrow();
-  expect(() => config({ ...h.bindings, SHARDS: "0" })).toThrow();
-  expect(() => config({ ...h.bindings, REPLICA_TIMEOUT_MS: "-1" })).toThrow();
+  expect(config(h.bindings).shards).toBe(128);
+  expect(config(h.bindings).syncMs).toBe(600_000);
+  expect(config(h.bindings).hints).toEqual(["apac", "enam", "weur"]);
+  expect(() => config({ ...h.bindings, QKV_LOCATION_HINTS: "apac,apac,weur" })).toThrow();
+  expect(() => config({ ...h.bindings, QKV_SHARDS: "0" })).toThrow();
+  expect(() => config({ ...h.bindings, QKV_REPLICA_TIMEOUT_MS: "-1" })).toThrow();
 });
 
 it("bounds timer configuration and isolates the default hints", async () => {
   const h = await setup();
-  expect(config({ ...h.bindings, LOCATION_HINTS: " apac , me , weur " }).hints).toEqual([
+  expect(config({ ...h.bindings, QKV_LOCATION_HINTS: " apac , me , weur " }).hints).toEqual([
     "apac",
     "me",
     "weur",
   ]);
-  expect(config({ ...h.bindings, REPLICA_TIMEOUT_MS: "2147483647" }).timeoutMs).toBe(2 ** 31 - 1);
-  expect(() => config({ ...h.bindings, REPLICA_TIMEOUT_MS: "2147483648" })).toThrow();
+  expect(config({ ...h.bindings, QKV_REPLICA_TIMEOUT_MS: "2147483647" }).timeoutMs).toBe(
+    2 ** 31 - 1,
+  );
+  expect(() => config({ ...h.bindings, QKV_REPLICA_TIMEOUT_MS: "2147483648" })).toThrow();
   const hints = config(h.bindings).hints;
   hints[0] = "wnam";
-  expect(config(h.bindings).hints).toEqual(["apac", "me", "weur"]);
+  expect(config(h.bindings).hints).toEqual(["apac", "enam", "weur"]);
 });
 
 it("has no fault-injection RPC methods", async () => {
@@ -527,7 +530,7 @@ it("caps small-record pulls per alarm and resumes from the durable cursor", asyn
   const h = await setup();
   const source = h.replicas[0]!.stub;
   const target = h.replicas[2]!.stub;
-  const batchRows = 4; // The Workers project's SYNC_BATCH.
+  const batchRows = 4; // The Workers project's QKV_SYNC_BATCH.
   const count = batchRows * (SYNC_ALARM_PULLS + 3);
   for (let i = 0; i < count; i++) {
     await source.write(
@@ -799,7 +802,7 @@ it("syncs retained expired versions even when their deadline predates grace", as
 });
 
 it("enforces the configurable byte limit before RPCs", async () => {
-  const h = await setup({ MAX_VALUE_BYTES: "4" });
+  const h = await setup({ QKV_MAX_VALUE_BYTES: "4" });
   const phases = h.phases.length;
   await expect(h.kv.put(h.key, new ArrayBuffer(5))).rejects.toBeInstanceOf(RangeError);
   await expect(h.kv.put(h.key, bytes("ééé"))).rejects.toBeInstanceOf(RangeError);
@@ -807,13 +810,13 @@ it("enforces the configurable byte limit before RPCs", async () => {
   await h.kv.put(h.key, new ArrayBuffer(4));
   expect((await h.kv.get(h.key))!.byteLength).toBe(4);
   expect(config(h.bindings).maxValueBytes).toBe(4);
-  expect(() => config({ ...h.bindings, MAX_VALUE_BYTES: "0" })).toThrow();
+  expect(() => config({ ...h.bindings, QKV_MAX_VALUE_BYTES: "0" })).toThrow();
 });
 
-it("accepts the default 1 MiB boundary and rejects a larger programmatic value", async () => {
+it("accepts the default 4 MiB boundary and rejects a larger programmatic value", async () => {
   const h = await setup();
   const size = config(h.bindings).maxValueBytes;
-  expect(size).toBe(1024 * 1024);
+  expect(size).toBe(4 * 1024 * 1024);
   await h.kv.put(h.key, new ArrayBuffer(size));
   expect((await h.kv.get(h.key))!.byteLength).toBe(size);
   await expect(h.kv.put(h.key, new ArrayBuffer(size + 1))).rejects.toBeInstanceOf(RangeError);

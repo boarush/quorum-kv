@@ -83,7 +83,7 @@ it("runs an installed tarball consumer with checked declarations and real SQLite
       import type { QuorumKV as DeepQuorumKV } from "quorum-kv/dist/index.js";
       export { Api, Replica };
       export async function use(env: QuorumKVEnv, ctx: ExecutionContext) {
-        const settings: ReplicaConfig = { SHARDS: "1024" };
+        const settings: ReplicaConfig = { QKV_SHARDS: "1024" };
         const options: QuorumKVOptions = { onPhase: (phase: Phase) => console.log(phase.name) };
         const kv = new QuorumKV({ ...env, ...settings }, ctx, options);
         const methods: Record<keyof QuorumKV, true> = { get: true, put: true, delete: true };
@@ -163,7 +163,7 @@ it("runs an installed tarball consumer with checked declarations and real SQLite
             },
             env: {
               REPLICAS: { type: "durable-object", worker: "consumer", exportName: "Replica" },
-              MAX_VALUE_BYTES: { type: "text", value: "8" },
+              QKV_MAX_VALUE_BYTES: { type: "text", value: "8" },
             },
             exports: { Replica: { type: "durable-object", storage: "sqlite" } },
           },

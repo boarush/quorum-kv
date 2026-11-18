@@ -91,23 +91,24 @@ Source internals are not package export paths.
 
 ## How the pieces fit together
 
-A SHA-256 hash of the key picks one of 1024 fixed shards. Replica names follow the pattern
+A SHA-256 hash of the key picks one of `QKV_SHARDS` fixed shards (128 by default).
+Replica names follow the pattern
 `shard-<n>-r<i>`, and each replica can derive its siblings from its own name. The current
 runtime preserves `ctx.id.name` for named RPCs and alarms.
 
 ```mermaid
 flowchart LR
     C[Caller Worker] -->|"api.get / put / delete"| W["Api<br/>WorkerEntrypoint"]
-    W -->|"SHA-256(key) mod 1024"| S["shard n"]
+    W -->|"SHA-256(key) mod shard count"| S["shard n"]
     S --> R0["shard-n-r0<br/>apac"]
-    S --> R1["shard-n-r1<br/>me"]
+    S --> R1["shard-n-r1<br/>enam"]
     S --> R2["shard-n-r2<br/>weur"]
     R0 <-.->|"anti-entropy pull"| R1
     R1 <-.->|"anti-entropy pull"| R2
     R0 <-.->|"anti-entropy pull"| R2
 ```
 
-The default placement hints are `apac`, `me`, and `weur`. They are only hints: they apply when
+The default placement hints are `apac`, `enam`, and `weur`. They are only hints: they apply when
 an object is first located and do not guarantee that the three replicas live in separate
 regions. You can change them, but don't change the shard count, hash, replica names, or hint
 ordering of an existing deployment without a migration.
@@ -206,8 +207,8 @@ Embedded consumers call the same methods directly on `QuorumKV`.
 | `put`    | `put(key, value, { ttlSeconds? })` | Resolves after the write quorum                           |
 | `delete` | `delete(key)`                      | Resolves after the delete quorum; absent keys are fine    |
 
-Keys are UTF-8 strings capped at 1024 bytes. Values default to a 1 MiB limit and can be raised
-with `MAX_VALUE_BYTES`. `put` throws `RangeError` for an invalid key, invalid TTL, or oversized
+Keys are UTF-8 strings capped at 1024 bytes. Values default to a 4 MiB limit and can be raised
+with `QKV_MAX_VALUE_BYTES`. `put` throws `RangeError` for an invalid key, invalid TTL, or oversized
 value before any replica RPC happens.
 
 The default value limit leaves room for key and version metadata under the
@@ -232,15 +233,19 @@ Configure these on the Worker hosting `Replica`, and pass the same bindings to `
 Don't independently override coordinator topology, value limits, or GC settings; coordinator and
 replicas need compatible configuration. No separate Alchemy runtime dependency is required.
 
-| Binding              | Default            | What it controls                                               |
-| -------------------- | ------------------ | -------------------------------------------------------------- |
-| `SHARDS`             | `1024`             | Number of key shards                                           |
-| `LOCATION_HINTS`     | `apac,me,weur`     | Three distinct placement hints, in replica order               |
-| `REPLICA_TIMEOUT_MS` | `1500`             | Per-phase, per-replica timeout; also the shared sync deadline  |
-| `GC_GRACE_MS`        | `86400000` (1 day) | Minimum age before a tombstone or expired row can be collected |
-| `SYNC_MS`            | `30000`            | Anti-entropy period, and how often the cleanup alarm runs      |
-| `SYNC_BATCH`         | `256`              | Rows per sync pull                                             |
-| `MAX_VALUE_BYTES`    | `1048576` (1 MiB)  | Largest accepted value                                         |
+Set overrides as strings, for example `QKV_SHARDS = "2048"` under `[vars]` in `wrangler.toml`.
+When renaming existing bindings to use the `QKV_` prefix, keep their values unchanged. Only the
+names below are read; an unset binding falls back to its default.
+
+| Binding                  | Default            | What it controls                                               |
+| ------------------------ | ------------------ | -------------------------------------------------------------- |
+| `QKV_SHARDS`             | `128`              | Number of key shards                                           |
+| `QKV_LOCATION_HINTS`     | `apac,enam,weur`   | Three distinct placement hints, in replica order               |
+| `QKV_REPLICA_TIMEOUT_MS` | `1500`             | Per-phase, per-replica timeout; also the shared sync deadline  |
+| `QKV_GC_GRACE_MS`        | `86400000` (1 day) | Minimum age before a tombstone or expired row can be collected |
+| `QKV_SYNC_MS`            | `600000`           | Anti-entropy period, and how often the cleanup alarm runs      |
+| `QKV_SYNC_BATCH`         | `256`              | Rows per sync pull                                             |
+| `QKV_MAX_VALUE_BYTES`    | `4194304` (4 MiB)  | Largest accepted value                                         |
 
 ## Expiration and garbage collection
 
@@ -251,7 +256,7 @@ cleanup without scanning non-TTL rows, and a partial `gc_at` index keeps collect
 table scan.
 
 Payloads are cleared at their deadline or at the next periodic alarm, whichever comes first.
-Tombstone collection rides the same `SYNC_MS` alarm, so a larger `SYNC_MS` delays both.
+Tombstone collection rides the same `QKV_SYNC_MS` alarm, so a larger `QKV_SYNC_MS` delays both.
 
 Rows are only physically deleted after the GC grace period _and_ acknowledgment from both peers
 that they have seen the row's local sequence. Duplicate writes don't extend tombstone grace. A
@@ -260,13 +265,13 @@ wiping a replica needs a rebuild protocol that doesn't exist yet.
 
 ## Background sync (anti-entropy)
 
-Each replica pulls changed rows from its two siblings every `SYNC_MS` (30 seconds by default),
+Each replica pulls changed rows from its two siblings every `QKV_SYNC_MS` (10 minutes by default),
 including right after a write. Clients never have to trigger this.
 
-A pull returns at most `SYNC_BATCH` rows, assembled incrementally under a 4 MiB budget that
+A pull returns at most `QKV_SYNC_BATCH` rows, assembled incrementally under a 4 MiB budget that
 accounts for payload copies, strings, and metadata — headroom for RPC serialization and for
 pulls running against both peers at once. Each peer's sync stops after eight pulls, 16 MiB of
-budgeted bytes, or one shared `REPLICA_TIMEOUT_MS` deadline, whichever comes first. A final
+budgeted bytes, or one shared `QKV_REPLICA_TIMEOUT_MS` deadline, whichever comes first. A final
 batch may exceed the byte quota, and a single row bigger than the budget is returned alone so
 recovery still advances; its size is bounded by the SQLite row limit.
 
@@ -281,7 +286,7 @@ periodic alarms even when empty, so a stale peer can catch up without any client
 
 ```mermaid
 flowchart LR
-    A["Alarm fires<br/>every SYNC_MS or at next TTL"] --> B["Pull from each peer<br/>≤ 8 pulls, 16 MiB, 1 timeout"]
+    A["Alarm fires<br/>every QKV_SYNC_MS or at next TTL"] --> B["Pull from each peer<br/>≤ 8 pulls, 16 MiB, 1 timeout"]
     B --> C["Drop payloads past their deadline"]
     C --> D["Collect tombstones and<br/>expired rows past grace + peer acks"]
     D --> E["Schedule the next alarm"]
@@ -350,7 +355,7 @@ storage inspection, alarm delivery, and eviction.
 
 Fault injection uses Vitest prototype spies scoped to selected instances, entirely in
 `test/fixtures.ts`. After each test, background contexts drain, spies are restored, and binding
-storage is reset. Only this project's Vitest configuration sets `SYNC_BATCH=4` for pagination
+storage is reset. Only this project's Vitest configuration sets `QKV_SYNC_BATCH=4` for pagination
 coverage; the runtime has no test flag, debug bridge, or fault-injection RPCs.
 
 ## Running the standalone test stack
