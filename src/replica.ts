@@ -1,9 +1,8 @@
 import { DurableObject } from "cloudflare:workers";
-import type { QuorumKVEnv } from "./config.js";
-import { config } from "./config.js";
-import { compare, EMPTY, type RecordValue, type Version } from "./model.js";
-import { COLLECT_GARBAGE, EXPIRE_RECORDS, SCHEDULE_EXPIRATION } from "./statements.js";
-import { SYNC_ALARM_BYTES, SYNC_ALARM_PULLS, SYNC_BATCH_BYTES, syncRowBytes } from "./sync.js";
+import { config, type QuorumKVEnv } from "./config";
+import { compare, EMPTY, type RecordValue, type Version } from "./model";
+import { COLLECT_GARBAGE, EXPIRE_RECORDS, SCHEDULE_EXPIRATION } from "./statements";
+import { SYNC_ALARM_BYTES, SYNC_ALARM_PULLS, SYNC_BATCH_BYTES, syncRowBytes } from "./sync";
 
 type Row = {
   key: string;

@@ -20,8 +20,8 @@
     }
   },
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
-    "build:watch": "tsc -p tsconfig.build.json --watch",
+    "build": "tsc -p tsconfig.build.json && tsdown",
+    "build:watch": "tsdown --watch",
     "prepack": "npm run build",
     "pretest": "npm run build",
     "test": "vitest run",
@@ -48,6 +48,7 @@
     "miniflare": "5.20261110.0-beta",
     "oxfmt": "^0.78.0",
     "oxlint": "^1.93.0",
+    "tsdown": "^0.22.14",
     "typescript": "latest",
     "vitest": "5.0.4",
     "ws": "8.22.2"

@@ -1,7 +1,6 @@
-import type { QuorumKVEnv } from "./config.js";
-import { config } from "./config.js";
-import { compare, type RecordValue } from "./model.js";
-import type { Replica } from "./replica.js";
+import { config, type QuorumKVEnv } from "./config";
+import { compare, type RecordValue } from "./model";
+import type { Replica } from "./replica";
 
 export class QuorumUnavailable extends Error {
   readonly code = "QUORUM_UNAVAILABLE";

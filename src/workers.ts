@@ -1,8 +1,8 @@
 import { WorkerEntrypoint } from "cloudflare:workers";
-import type { QuorumKVEnv } from "./config.js";
-import { QuorumKV, type PutOptions } from "./coordinator.js";
+import type { QuorumKVEnv } from "./config";
+import { QuorumKV, type PutOptions } from "./coordinator";
 
-export { Replica } from "./replica.js";
+export { Replica } from "./replica";
 
 /** Optional service-binding adapter. Embedded consumers only need Replica. */
 export class Api extends WorkerEntrypoint<QuorumKVEnv> {

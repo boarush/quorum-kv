@@ -1,4 +1,4 @@
-import type { Replica } from "./replica.js";
+import type { Replica } from "./replica";
 
 /** String bindings shared by the coordinator and its replicas. */
 export interface ReplicaConfig {

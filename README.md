@@ -317,13 +317,27 @@ boundary around an expiration.
 
 ```sh
 npm ci
-npm run build        # ESM JavaScript and declarations in dist/
+npm run build        # Bundle ESM and declarations into dist/
 npm run check        # TypeScript, Oxlint, Oxfmt check, and the Vitest suite
 npm run format       # apply Oxfmt
 ```
 
+Like Cloudflare's Agents SDK, the package build uses tsdown to bundle JavaScript and TypeScript
+declarations. Source imports can omit extensions; generated ESM uses explicit extensions for
+any shared chunks. The build keeps the two public entry points separate and leaves
+`cloudflare:workers` for the Workers runtime.
+
 `npm test` builds the package and runs the suite locally, without Cloudflare credentials or
-cloud state-store bootstrap. The Node package tests install a local tarball offline, compile an\nisolated TypeScript consumer (including public-API boundary checks), then bundle and run that\ninstalled package inside workerd with real SQLite Durable Objects. Bundle inputs are checked to\nprevent accidentally resolving checkout source instead of the installed package. The test-only\nHTTP fixture is `test/consumer/worker.ts`; it is not shipped in the package. Workers tests also\nimport the built public exports and exercise embedded use, the optional RPC adapter, and faults.\n\n`.github/workflows/ci.yml` runs `npm ci`, `npm run check`, and `npm pack --dry-run` from clean\ncheckouts on Linux with the minimum supported Node version (24.11.1) and Node 26. It does not\ndeploy or require Cloudflare credentials.
+cloud state-store bootstrap. The Node package tests install a local tarball offline, compile an
+isolated TypeScript consumer (including public-API boundary checks), then bundle and run that
+installed package inside workerd with real SQLite Durable Objects. Bundle inputs are checked to
+prevent accidentally resolving checkout source instead of the installed package. The test-only
+HTTP fixture is `test/consumer/worker.ts`; it is not shipped in the package. Workers tests also
+import the built public exports and exercise embedded use, the optional RPC adapter, and faults.
+
+`.github/workflows/ci.yml` runs `npm ci`, `npm run check`, and `npm pack --dry-run` from clean
+checkouts on Linux with the minimum supported Node version (24.11.1) and Node 26. It does not
+deploy or require Cloudflare credentials.
 
 ### Testing Durable Objects
 

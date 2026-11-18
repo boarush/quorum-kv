@@ -79,8 +79,8 @@ it("runs an installed tarball consumer with checked declarations and real SQLite
       import { QuorumKV, QuorumUnavailable, type QuorumKVEnv, type ReplicaConfig,
         type PutOptions, type QuorumKVOptions, type Phase } from "quorum-kv";
       import { Api, Replica } from "quorum-kv/workers";
-      // @ts-expect-error Internal package files are not public export paths.
-      import type { Version } from "quorum-kv/dist/model.js";
+      // @ts-expect-error The file exists in the tarball but is not a public export path.
+      import type { QuorumKV as DeepQuorumKV } from "quorum-kv/dist/index.js";
       export { Api, Replica };
       export async function use(env: QuorumKVEnv, ctx: ExecutionContext) {
         const settings: ReplicaConfig = { SHARDS: "1024" };
