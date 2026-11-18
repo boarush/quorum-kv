@@ -18,8 +18,15 @@ quorum-kv is an ESM library for **Cloudflare Workers with SQLite Durable Objects
 runtime npm dependencies. Embedding it in your own Worker avoids the extra service-binding hop;
 replica RPCs, alarms, and storage still run on Cloudflare. This is not a Node.js storage backend.
 
-Until the package is published, build and pack this checkout, then install the tarball in your
-Worker project:
+Install directly from GitHub with npm. Pin the dependency to a tag or commit that includes the
+`prepare` hook, which builds `dist/` during installation:
+
+```sh
+npm install 'git+ssh://git@github.com/foyer-work/quorum-kv.git#<tag-or-commit>'
+```
+
+This requires Node.js 24.11.1 or newer, SSH access to the private repository, and npm lifecycle
+scripts enabled. To install from a checkout instead:
 
 ```sh
 npm ci
@@ -58,6 +65,19 @@ A complete read-only example is in `examples/embedded/`. Add your application's 
 before exposing stored data over HTTP. TypeScript consumers should use their generated Worker
 runtime types (`wrangler types`) or `@cloudflare/workers-types`, with `lib: ["ES2022"]` rather than
 browser DOM types.
+
+### Tagging a version
+
+Update the version in `package.json` and `package-lock.json`, then commit and push to
+`foyer-work/quorum-kv`. Tag that commit with the matching version and push the tag to the org
+remote:
+
+```sh
+git tag v0.1.0
+git push foyer-work v0.1.0
+```
+
+Consumers can pin to that tag directly. No GitHub Release or npm registry publish is required.
 
 ### Public exports
 
